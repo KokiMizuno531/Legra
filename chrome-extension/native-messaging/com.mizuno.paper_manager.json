@@ -1,0 +1,9 @@
+{
+  "name": "com.mizuno.paper_manager",
+  "description": "paper-manager Chrome import native host",
+  "path": "/Users/mizuno/Documents/App_make/paper-manager/src-tauri/target/debug/paper_manager_native_host",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://ecempmaadmdakdkcnhojbabljjaahkmg/"
+  ]
+}

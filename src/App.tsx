@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
@@ -46,10 +46,26 @@ type AppData = {
     managed_directory?: string;
     filename_rule: string;
     note_directory?: string;
+    marktext_path?: string;
+    pdf_viewer_path?: string;
+    chrome_import_directory?: string;
+    bibtex_key_rule: string;
+    bibtex_export_rule: string;
+    journal_output_style: string;
+    journal_aliases: JournalAlias[];
+    workspace_root?: string;
+    workspace_revision?: number;
+    workspace_last_loaded_revision?: number;
     cloud_sync_expected: boolean;
     created_at: string;
     updated_at: string;
   };
+};
+
+type JournalAlias = {
+  full_name: string;
+  abbreviation: string;
+  aliases: string[];
 };
 
 type Note = {
@@ -105,6 +121,24 @@ type PaperMetadata = {
   abstract_text?: string;
 };
 
+type PaperImportResolution = {
+  metadata: PaperMetadata;
+  downloaded_pdf_path?: string;
+  warnings: string[];
+};
+
+type ExtensionImportSummary = {
+  imported: number;
+  failed: number;
+  pending: number;
+  messages: string[];
+};
+
+type WorkspaceHealth = {
+  ok: boolean;
+  warnings: string[];
+};
+
 type Filters = {
   query: string;
   tag: string;
@@ -112,6 +146,21 @@ type Filters = {
   status: string;
   year: string;
   sort: string;
+};
+
+type SettingsForm = {
+  managed_directory: string;
+  marktext_path: string;
+  pdf_viewer_path: string;
+  chrome_import_directory: string;
+  filename_rule: string;
+  bibtex_key_rule: string;
+  bibtex_export_rule: string;
+  journal_output_style: string;
+  journal_aliases: JournalAlias[];
+  note_directory: string;
+  workspace_root: string;
+  cloud_sync_expected: boolean;
 };
 
 const initialForm: PaperForm = {
@@ -144,6 +193,21 @@ const initialFilters: Filters = {
   sort: "updated_desc",
 };
 
+const initialSettingsForm: SettingsForm = {
+  managed_directory: "",
+  marktext_path: "",
+  pdf_viewer_path: "",
+  chrome_import_directory: "",
+  filename_rule: "{year}_{first_author}_{journal}.pdf",
+  bibtex_key_rule: "",
+  bibtex_export_rule: "doi_preferred",
+  journal_output_style: "as_stored",
+  journal_aliases: [],
+  note_directory: "",
+  workspace_root: "",
+  cloud_sync_expected: true,
+};
+
 function parseList(value: string) {
   return value
     .split(/[,;\n]/)
@@ -168,6 +232,13 @@ function metadataKey(form: PaperForm) {
   }
 
   return "";
+}
+
+function mergeResolvedImport(current: PaperForm, resolution: PaperImportResolution): PaperForm {
+  return {
+    ...metadataToForm(current, resolution.metadata),
+    pdf_path: resolution.downloaded_pdf_path ?? current.pdf_path,
+  };
 }
 
 function isReadyToRegister(form: PaperForm) {
@@ -217,6 +288,24 @@ function paperToForm(paper: Paper): PaperForm {
   };
 }
 
+function settingsToForm(settings: AppData["settings"]): SettingsForm {
+  return {
+    managed_directory: settings.managed_directory ?? "",
+    marktext_path: settings.marktext_path ?? "",
+    pdf_viewer_path: settings.pdf_viewer_path ?? "",
+    chrome_import_directory: settings.chrome_import_directory ?? "",
+    filename_rule: settings.filename_rule || initialSettingsForm.filename_rule,
+    bibtex_key_rule: settings.bibtex_key_rule ?? "",
+    bibtex_export_rule: settings.bibtex_export_rule || initialSettingsForm.bibtex_export_rule,
+    journal_output_style:
+      settings.journal_output_style || initialSettingsForm.journal_output_style,
+    journal_aliases: settings.journal_aliases ?? [],
+    note_directory: settings.note_directory ?? "",
+    workspace_root: settings.workspace_root ?? "",
+    cloud_sync_expected: settings.cloud_sync_expected,
+  };
+}
+
 function formToInput(form: PaperForm) {
   const year = form.year.trim() ? Number(form.year) : undefined;
   if (year !== undefined && !Number.isInteger(year)) {
@@ -253,9 +342,35 @@ function includesText(value: string | undefined, query: string) {
   return value?.toLowerCase().includes(query) ?? false;
 }
 
+function categoryAncestors(category: string) {
+  const parts = category
+    .split("/")
+    .map((part) => part.trim())
+    .filter(Boolean);
+  return parts.map((_, index) => parts.slice(0, index + 1).join("/"));
+}
+
+function categoryMatchesFilter(category: string | undefined, filter: string) {
+  if (filter === "all") {
+    return true;
+  }
+
+  if (filter === "none") {
+    return !category;
+  }
+
+  const normalizedCategory = category?.trim();
+  if (!normalizedCategory) {
+    return false;
+  }
+
+  return normalizedCategory === filter || normalizedCategory.startsWith(`${filter}/`);
+}
+
 function App() {
   const currentWindowLabel = getCurrentWebviewWindow().label;
   const isRegisterWindow = currentWindowLabel === "register-paper";
+  const isSettingsWindow = currentWindowLabel === "settings";
   const editWindowPaperId = currentWindowLabel.startsWith("edit-paper-")
     ? currentWindowLabel.slice("edit-paper-".length)
     : null;
@@ -268,7 +383,13 @@ function App() {
   const [focusedPaperId, setFocusedPaperId] = useState<string | null>(null);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [filters, setFilters] = useState<Filters>(initialFilters);
+  const [settingsForm, setSettingsForm] = useState<SettingsForm>(initialSettingsForm);
+  const [utilityMenuOpen, setUtilityMenuOpen] = useState(false);
   const [bibtexOutput, setBibtexOutput] = useState("");
+  const [bibtexJournalStyle, setBibtexJournalStyle] = useState(
+    initialSettingsForm.journal_output_style,
+  );
+  const [importSource, setImportSource] = useState("");
   const [metadataLoading, setMetadataLoading] = useState(false);
   const [message, setMessage] = useState("Loading saved papers...");
   const [error, setError] = useState<string | null>(null);
@@ -276,6 +397,7 @@ function App() {
   const allPapers = data?.papers ?? [];
   const editingPaper = allPapers.find((paper) => paper.id === editingId) ?? null;
   const focusedPaper = allPapers.find((paper) => paper.id === focusedPaperId) ?? null;
+  const utilityMenuRef = useRef<HTMLDivElement | null>(null);
 
   const availableTags = useMemo(
     () => Array.from(new Set(allPapers.flatMap((paper) => paper.tags))).sort(),
@@ -287,7 +409,8 @@ function App() {
         new Set(
           allPapers
             .map((paper) => paper.folder_category?.trim())
-            .filter((category): category is string => Boolean(category)),
+            .filter((category): category is string => Boolean(category))
+            .flatMap(categoryAncestors),
         ),
       ).sort(),
     [allPapers],
@@ -306,10 +429,7 @@ function App() {
           includesText(paper.doi, query) ||
           includesText(paper.arxiv_id, query);
         const matchesTag = filters.tag === "" || paper.tags.includes(filters.tag);
-        const matchesCategory =
-          filters.category === "all" ||
-          (filters.category === "none" && !paper.folder_category) ||
-          paper.folder_category === filters.category;
+        const matchesCategory = categoryMatchesFilter(paper.folder_category, filters.category);
         const matchesStatus = filters.status === "all" || paper.status === filters.status;
         const matchesYear = year.length === 0 || paper.year?.toString() === year;
         return matchesQuery && matchesTag && matchesCategory && matchesStatus && matchesYear;
@@ -341,7 +461,36 @@ function App() {
     ]);
     setStatus(nextStatus);
     setData(nextData);
+    setSettingsForm(settingsToForm(nextData.settings));
+    setBibtexJournalStyle(
+      nextData.settings.journal_output_style || initialSettingsForm.journal_output_style,
+    );
     setMessage(`Loaded ${nextData.papers.length} papers.`);
+  }
+
+  async function processExtensionImports(options: { silent?: boolean } = {}) {
+    if (!options.silent) {
+      setError(null);
+    }
+    try {
+      const summary = await invoke<ExtensionImportSummary>("process_extension_imports");
+      if (summary.imported > 0 || summary.failed > 0) {
+        await loadSavedData();
+        setMessage(
+          `Chrome imports: ${summary.imported} imported, ${summary.failed} failed, ${summary.pending} pending.`,
+        );
+      } else if (!options.silent) {
+        setMessage("No Chrome extension imports are pending.");
+      }
+      if (summary.failed > 0) {
+        setError(summary.messages.join(" "));
+      }
+    } catch (reason) {
+      if (!options.silent) {
+        setError(String(reason));
+        setMessage("Could not process Chrome extension imports.");
+      }
+    }
   }
 
   async function choosePdf(target: "register" | "edit") {
@@ -450,6 +599,30 @@ function App() {
     }
   }
 
+  async function chooseSettingsDirectory(field: keyof SettingsForm) {
+    setError(null);
+    const selected = await open({
+      directory: true,
+      multiple: false,
+    });
+
+    if (typeof selected === "string") {
+      updateSettingsForm(field, selected);
+    }
+  }
+
+  async function chooseSettingsApp(field: keyof SettingsForm) {
+    setError(null);
+    const selected = await open({
+      directory: true,
+      multiple: false,
+    });
+
+    if (typeof selected === "string") {
+      updateSettingsForm(field, selected);
+    }
+  }
+
   async function createBackup() {
     setError(null);
     const selected = await open({
@@ -528,6 +701,102 @@ function App() {
     }
   }
 
+  async function chooseWorkspaceDirectory() {
+    const selected = await open({
+      directory: true,
+      multiple: false,
+    });
+    return typeof selected === "string" ? selected : null;
+  }
+
+  async function createSharedWorkspace() {
+    setError(null);
+    const selected = await chooseWorkspaceDirectory();
+    if (!selected) {
+      return;
+    }
+
+    try {
+      const nextData = await invoke<AppData>("create_shared_workspace", {
+        input: { workspace_dir: selected },
+      });
+      setData(nextData);
+      setSettingsForm(settingsToForm(nextData.settings));
+      await refreshStatus();
+      setMessage("Shared workspace created.");
+    } catch (reason) {
+      setError(String(reason));
+      setMessage("Could not create shared workspace.");
+    }
+  }
+
+  async function openSharedWorkspace() {
+    setError(null);
+    const selected = await chooseWorkspaceDirectory();
+    if (!selected) {
+      return;
+    }
+
+    try {
+      const nextData = await invoke<AppData>("open_shared_workspace", {
+        input: { workspace_dir: selected },
+      });
+      setData(nextData);
+      setSettingsForm(settingsToForm(nextData.settings));
+      setSelectedIds([]);
+      setFocusedPaperId(null);
+      await refreshStatus();
+      setMessage("Shared workspace opened.");
+    } catch (reason) {
+      setError(String(reason));
+      setMessage("Could not open shared workspace.");
+    }
+  }
+
+  async function convertCurrentLibraryToWorkspace() {
+    setError(null);
+    const selected = await chooseWorkspaceDirectory();
+    if (!selected) {
+      return;
+    }
+
+    const confirmed = window.confirm(
+      "Convert the current library into this shared workspace? Existing files are copied into the workspace.",
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    try {
+      const nextData = await invoke<AppData>("convert_current_library_to_workspace", {
+        input: { workspace_dir: selected },
+      });
+      setData(nextData);
+      setSettingsForm(settingsToForm(nextData.settings));
+      await refreshStatus();
+      setMessage("Current library converted to a shared workspace.");
+    } catch (reason) {
+      setError(String(reason));
+      setMessage("Could not convert library to shared workspace.");
+    }
+  }
+
+  async function checkWorkspaceHealth() {
+    setError(null);
+    try {
+      const health = await invoke<WorkspaceHealth>("check_workspace_health");
+      if (health.ok) {
+        setMessage("Workspace health check passed.");
+      } else {
+        setError(health.warnings.join(" "));
+        setMessage(`Workspace health check found ${health.warnings.length} issue(s).`);
+      }
+    } catch (reason) {
+      setError(String(reason));
+      setMessage("Could not check workspace health.");
+    }
+  }
+
   async function fetchMetadataForRegistration() {
     const key = metadataKey(form);
     if (!key) {
@@ -556,11 +825,40 @@ function App() {
     }
   }
 
-  async function registerPaper(event: React.FormEvent<HTMLFormElement>) {
-    event.preventDefault();
+  async function resolvePaperImport() {
+    if (!importSource.trim()) {
+      setError("Enter a DOI, arXiv ID, or paper URL before fetching.");
+      return null;
+    }
+
+    setError(null);
+    setMetadataLoading(true);
+    try {
+      const resolution = await invoke<PaperImportResolution>("resolve_paper_import", {
+        input: { source: importSource },
+      });
+      setForm((current) => mergeResolvedImport(current, resolution));
+      const warningText =
+        resolution.warnings.length > 0 ? ` ${resolution.warnings.join(" ")}` : "";
+      setMessage(
+        resolution.downloaded_pdf_path
+          ? `Metadata fetched and PDF downloaded.${warningText}`
+          : `Metadata fetched.${warningText}`,
+      );
+      return resolution;
+    } catch (reason) {
+      setError(String(reason));
+      setMessage("Could not resolve paper input.");
+      return null;
+    } finally {
+      setMetadataLoading(false);
+    }
+  }
+
+  async function registerForm(registrationForm: PaperForm) {
     setError(null);
 
-    if (!isReadyToRegister(form)) {
+    if (!isReadyToRegister(registrationForm)) {
       setError("Title and at least one author are required.");
       setMessage("Registration failed.");
       return;
@@ -568,11 +866,12 @@ function App() {
 
     try {
       const nextData = await invoke<AppData>("register_paper", {
-        input: formToInput(form),
+        input: formToInput(registrationForm),
       });
       setData(nextData);
       await refreshStatus();
       setForm(initialForm);
+      setImportSource("");
       const registeredPaper = nextData.papers[nextData.papers.length - 1];
       setMessage(
         registeredPaper?.pdf_path
@@ -583,6 +882,21 @@ function App() {
       setError(String(reason));
       setMessage("Registration failed.");
     }
+  }
+
+  async function registerPaper(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    await registerForm(form);
+  }
+
+  async function fetchAndRegisterPaper() {
+    const resolution = await resolvePaperImport();
+    if (!resolution) {
+      return;
+    }
+
+    const resolvedForm = mergeResolvedImport(form, resolution);
+    await registerForm(resolvedForm);
   }
 
   async function saveEditedPaper(event: React.FormEvent<HTMLFormElement>) {
@@ -609,6 +923,35 @@ function App() {
     } catch (reason) {
       setError(String(reason));
       setMessage("Update failed.");
+    }
+  }
+
+  async function saveSettings(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setError(null);
+
+    try {
+      const nextData = await invoke<AppData>("update_settings", {
+        input: {
+          managed_directory: optionalString(settingsForm.managed_directory),
+          marktext_path: optionalString(settingsForm.marktext_path),
+          pdf_viewer_path: optionalString(settingsForm.pdf_viewer_path),
+          chrome_import_directory: optionalString(settingsForm.chrome_import_directory),
+          filename_rule: settingsForm.filename_rule,
+          bibtex_key_rule: settingsForm.bibtex_key_rule,
+          bibtex_export_rule: settingsForm.bibtex_export_rule,
+          journal_output_style: settingsForm.journal_output_style,
+          journal_aliases: settingsForm.journal_aliases,
+          note_directory: optionalString(settingsForm.note_directory),
+          cloud_sync_expected: settingsForm.cloud_sync_expected,
+        },
+      });
+      setData(nextData);
+      setSettingsForm(settingsToForm(nextData.settings));
+      setMessage("Settings updated.");
+    } catch (reason) {
+      setError(String(reason));
+      setMessage("Could not update settings.");
     }
   }
 
@@ -660,11 +1003,54 @@ function App() {
     }
   }
 
+  async function deletePapers(paperIds: string[]) {
+    const uniqueIds = Array.from(new Set(paperIds)).filter(Boolean);
+    if (uniqueIds.length === 0) {
+      setError("Select at least one paper to delete.");
+      return;
+    }
+
+    const label =
+      uniqueIds.length === 1
+        ? allPapers.find((paper) => paper.id === uniqueIds[0])?.title ?? "this paper"
+        : `${uniqueIds.length} papers`;
+    const confirmed = window.confirm(
+      `Delete ${label} from paper-manager? PDF and note files will remain on disk.`,
+    );
+    if (!confirmed) {
+      return;
+    }
+
+    setError(null);
+    try {
+      const nextData = await invoke<AppData>("delete_papers", {
+        input: { paper_ids: uniqueIds },
+      });
+      setData(nextData);
+      setSelectedIds((current) => current.filter((paperId) => !uniqueIds.includes(paperId)));
+      if (focusedPaperId && uniqueIds.includes(focusedPaperId)) {
+        setFocusedPaperId(null);
+      }
+      if (editingId && uniqueIds.includes(editingId)) {
+        setEditingId(null);
+        setEditForm(initialForm);
+      }
+      setBibtexOutput("");
+      setMessage(`Deleted ${uniqueIds.length} paper${uniqueIds.length === 1 ? "" : "s"}.`);
+    } catch (reason) {
+      setError(String(reason));
+      setMessage("Delete failed.");
+    }
+  }
+
   async function generateSelectedBibtex() {
     setError(null);
     try {
       const content = await invoke<string>("generate_bibtex", {
-        input: { paper_ids: selectedIds },
+        input: {
+          paper_ids: selectedIds,
+          journal_output_style: bibtexJournalStyle,
+        },
       });
       setBibtexOutput(content);
       setMessage(`Generated BibTeX for ${selectedIds.length} papers.`);
@@ -732,6 +1118,43 @@ function App() {
     setFilters((current) => ({ ...current, [field]: value }));
   }
 
+  function updateSettingsForm(field: keyof SettingsForm, value: string | boolean) {
+    setSettingsForm((current) => ({ ...current, [field]: value }));
+  }
+
+  function addJournalAlias() {
+    setSettingsForm((current) => ({
+      ...current,
+      journal_aliases: [
+        ...current.journal_aliases,
+        { full_name: "", abbreviation: "", aliases: [] },
+      ],
+    }));
+  }
+
+  function updateJournalAlias(index: number, field: keyof JournalAlias, value: string) {
+    setSettingsForm((current) => ({
+      ...current,
+      journal_aliases: current.journal_aliases.map((alias, aliasIndex) => {
+        if (aliasIndex !== index) {
+          return alias;
+        }
+
+        return {
+          ...alias,
+          [field]: field === "aliases" ? parseList(value) : value,
+        };
+      }),
+    }));
+  }
+
+  function deleteJournalAlias(index: number) {
+    setSettingsForm((current) => ({
+      ...current,
+      journal_aliases: current.journal_aliases.filter((_, aliasIndex) => aliasIndex !== index),
+    }));
+  }
+
   function togglePaperSelection(paperId: string) {
     setSelectedIds((current) =>
       current.includes(paperId)
@@ -758,7 +1181,26 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (isRegisterWindow || isEditWindow) {
+    if (isRegisterWindow || isEditWindow || isSettingsWindow) {
+      return;
+    }
+
+    processExtensionImports({ silent: true }).catch((reason) => {
+      setError(String(reason));
+      setMessage("Failed to process Chrome extension imports.");
+    });
+
+    const interval = window.setInterval(() => {
+      processExtensionImports({ silent: true }).catch(() => {});
+    }, 5000);
+
+    return () => {
+      window.clearInterval(interval);
+    };
+  }, [isEditWindow, isRegisterWindow, isSettingsWindow]);
+
+  useEffect(() => {
+    if (isRegisterWindow || isEditWindow || isSettingsWindow) {
       return;
     }
 
@@ -777,7 +1219,7 @@ function App() {
     return () => {
       unlisten();
     };
-  }, []);
+  }, [isEditWindow, isRegisterWindow, isSettingsWindow]);
 
   useEffect(() => {
     if (!editWindowPaperId || !data) {
@@ -799,6 +1241,28 @@ function App() {
   }, [data, editWindowPaperId]);
 
   useEffect(() => {
+    if (!utilityMenuOpen) {
+      return;
+    }
+
+    function closeUtilityMenuOnOutsideClick(event: PointerEvent) {
+      const target = event.target;
+      if (
+        target instanceof Node &&
+        utilityMenuRef.current &&
+        !utilityMenuRef.current.contains(target)
+      ) {
+        setUtilityMenuOpen(false);
+      }
+    }
+
+    document.addEventListener("pointerdown", closeUtilityMenuOnOutsideClick);
+    return () => {
+      document.removeEventListener("pointerdown", closeUtilityMenuOnOutsideClick);
+    };
+  }, [utilityMenuOpen]);
+
+  useEffect(() => {
     if (!focusedPaperId) {
       return;
     }
@@ -808,7 +1272,311 @@ function App() {
     }
   }, [filteredPapers, focusedPaperId]);
 
-  return isEditWindow ? (
+  return isSettingsWindow ? (
+    <main className="app-shell">
+      <section className="workspace register-workspace">
+        <header className="topbar">
+          <div>
+            <p className="eyebrow">Settings window</p>
+            <h1>paper-manager</h1>
+          </div>
+          <div className="status-pill">
+            {data?.settings.updated_at ? "Settings loaded" : "Loading"}
+          </div>
+        </header>
+
+        <section className="panel bridge-panel">
+          <div className="storage-info">
+            <h2>Storage</h2>
+            <p className="path-text">
+              {data?.settings.workspace_root
+                ? `Workspace: ${data.settings.workspace_root.split('/').pop()}`
+                : `Managed: ${data?.settings.managed_directory ? data.settings.managed_directory.split('/').pop() : "Not set"}`}
+            </p>
+            <p>{message}</p>
+          </div>
+          <div className="storage-actions">
+            <button type="button" className="secondary-action" onClick={loadSavedData}>
+              Reload
+            </button>
+          </div>
+        </section>
+
+        {error ? <p className="error">Error: {error}</p> : null}
+
+        <form className="panel settings-form" onSubmit={saveSettings}>
+          <div className="section-heading">
+            <h2>Settings</h2>
+            <p>Configure storage, external apps, import staging, and naming rules.</p>
+          </div>
+
+          <div className="settings-section">
+            <h3>Storage</h3>
+            <label>
+              Managed directory
+              <div className="file-row">
+                <input
+                  value={settingsForm.managed_directory}
+                  onChange={(event) =>
+                    updateSettingsForm("managed_directory", event.currentTarget.value)
+                  }
+                  placeholder="/path/to/library"
+                />
+                <button
+                  type="button"
+                  onClick={() => chooseSettingsDirectory("managed_directory")}
+                >
+                  Select
+                </button>
+              </div>
+            </label>
+
+            <label>
+              Chrome / metadata import directory
+              <div className="file-row">
+                <input
+                  value={settingsForm.chrome_import_directory}
+                  onChange={(event) =>
+                    updateSettingsForm("chrome_import_directory", event.currentTarget.value)
+                  }
+                  placeholder="Leave blank for app setting/imports"
+                />
+                <button
+                  type="button"
+                  onClick={() => chooseSettingsDirectory("chrome_import_directory")}
+                >
+                  Select
+                </button>
+              </div>
+            </label>
+
+            <label>
+              Note directory
+              <div className="file-row">
+                <input
+                  value={settingsForm.note_directory}
+                  onChange={(event) =>
+                    updateSettingsForm("note_directory", event.currentTarget.value)
+                  }
+                  placeholder="Leave blank for app setting/notes"
+                />
+                <button
+                  type="button"
+                  onClick={() => chooseSettingsDirectory("note_directory")}
+                >
+                  Select
+                </button>
+              </div>
+            </label>
+          </div>
+
+          <div className="settings-section">
+            <h3>Shared workspace</h3>
+            <label>
+              Workspace root
+              <input
+                readOnly
+                value={settingsForm.workspace_root}
+                placeholder="No shared workspace is active"
+              />
+            </label>
+            <p className="settings-help">
+              Revision: {data?.settings.workspace_revision ?? "local only"}. Use a Google Drive,
+              Dropbox, or iCloud Drive folder to share the workspace with collaborators.
+            </p>
+            <div className="form-action-row compact-action-row">
+              <button type="button" className="secondary-action" onClick={createSharedWorkspace}>
+                Create workspace
+              </button>
+              <button type="button" className="secondary-action" onClick={openSharedWorkspace}>
+                Open workspace
+              </button>
+              <button
+                type="button"
+                className="secondary-action"
+                onClick={convertCurrentLibraryToWorkspace}
+              >
+                Convert current library
+              </button>
+              <button type="button" className="secondary-action" onClick={checkWorkspaceHealth}>
+                Health check
+              </button>
+            </div>
+          </div>
+
+          <div className="settings-section">
+            <h3>External apps</h3>
+            <div className="field-row">
+              <label>
+                MarkText path or app name
+                <div className="file-row">
+                  <input
+                    value={settingsForm.marktext_path}
+                    onChange={(event) =>
+                      updateSettingsForm("marktext_path", event.currentTarget.value)
+                    }
+                    placeholder="MarkText or /Applications/MarkText.app"
+                  />
+                  <button type="button" onClick={() => chooseSettingsApp("marktext_path")}>
+                    Select
+                  </button>
+                </div>
+              </label>
+
+              <label>
+                PDF viewer path or app name
+                <div className="file-row">
+                  <input
+                    value={settingsForm.pdf_viewer_path}
+                    onChange={(event) =>
+                      updateSettingsForm("pdf_viewer_path", event.currentTarget.value)
+                    }
+                    placeholder="Preview or /Applications/Preview.app"
+                  />
+                  <button type="button" onClick={() => chooseSettingsApp("pdf_viewer_path")}>
+                    Select
+                  </button>
+                </div>
+              </label>
+            </div>
+          </div>
+
+          <div className="settings-section">
+            <h3>Naming rules</h3>
+            <label>
+              PDF filename rule
+              <input
+                value={settingsForm.filename_rule}
+                onChange={(event) => updateSettingsForm("filename_rule", event.currentTarget.value)}
+                placeholder="{year}_{first_author}_{journal}.pdf"
+              />
+            </label>
+
+            <label>
+              BibTeX citation key rule
+              <input
+                value={settingsForm.bibtex_key_rule}
+                onChange={(event) =>
+                  updateSettingsForm("bibtex_key_rule", event.currentTarget.value)
+                }
+                placeholder="Empty: DOI suffix, then arXiv author-year"
+              />
+            </label>
+
+            <label>
+              BibTeX export rule
+              <select
+                value={settingsForm.bibtex_export_rule}
+                onChange={(event) =>
+                  updateSettingsForm("bibtex_export_rule", event.currentTarget.value)
+                }
+              >
+                <option value="doi_preferred">DOI / journal metadata preferred</option>
+                <option value="arxiv_only_when_no_doi">arXiv only when DOI is missing</option>
+              </select>
+            </label>
+
+            <label>
+              BibTeX journal output
+              <select
+                value={settingsForm.journal_output_style}
+                onChange={(event) =>
+                  updateSettingsForm("journal_output_style", event.currentTarget.value)
+                }
+              >
+                <option value="as_stored">As stored</option>
+                <option value="full">Full journal name</option>
+                <option value="abbreviation">Abbreviation</option>
+              </select>
+            </label>
+
+            <div className="journal-alias-editor">
+              <div className="section-heading compact-heading">
+                <h3>Journal aliases</h3>
+                <button type="button" className="secondary-action" onClick={addJournalAlias}>
+                  Add journal
+                </button>
+              </div>
+
+              {settingsForm.journal_aliases.length === 0 ? (
+                <div className="empty-state compact-empty">
+                  No journal aliases registered.
+                </div>
+              ) : (
+                <div className="journal-alias-list">
+                  {settingsForm.journal_aliases.map((alias, index) => (
+                    <div className="journal-alias-row" key={index}>
+                      <label>
+                        Full name
+                        <input
+                          value={alias.full_name}
+                          onChange={(event) =>
+                            updateJournalAlias(index, "full_name", event.currentTarget.value)
+                          }
+                          placeholder="Physical Review B"
+                        />
+                      </label>
+                      <label>
+                        Abbreviation
+                        <input
+                          value={alias.abbreviation}
+                          onChange={(event) =>
+                            updateJournalAlias(index, "abbreviation", event.currentTarget.value)
+                          }
+                          placeholder="Phys. Rev. B"
+                        />
+                      </label>
+                      <label>
+                        Aliases
+                        <input
+                          value={alias.aliases.join(", ")}
+                          onChange={(event) =>
+                            updateJournalAlias(index, "aliases", event.currentTarget.value)
+                          }
+                          placeholder="PRB, Phys Rev B"
+                        />
+                      </label>
+                      <button
+                        type="button"
+                        className="danger-action"
+                        onClick={() => deleteJournalAlias(index)}
+                      >
+                        Delete
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <p className="settings-help">
+              Placeholders: {"{year}"}, {"{first_author}"}, {"{last_name}"}, {"{journal}"}, {"{title}"}, {"{doi_suffix}"}, {"{arxiv_id}"}, {"{volume}"}, {"{pages}"}, {"{category}"}.
+            </p>
+          </div>
+
+          <label className="checkbox-label">
+            <input
+              checked={settingsForm.cloud_sync_expected}
+              onChange={(event) =>
+                updateSettingsForm("cloud_sync_expected", event.currentTarget.checked)
+              }
+              type="checkbox"
+            />
+            Cloud sync expected
+          </label>
+
+          <div className="form-action-row">
+            <button type="submit" className="primary-action">
+              Save settings
+            </button>
+            <button type="button" className="secondary-action" onClick={loadSavedData}>
+              Revert
+            </button>
+          </div>
+        </form>
+      </section>
+    </main>
+  ) : isEditWindow ? (
     <main className="app-shell">
       <section className="workspace register-workspace">
         <header className="topbar">
@@ -824,9 +1592,10 @@ function App() {
         <section className="panel bridge-panel">
           <div className="storage-info">
             <h2>Storage</h2>
-            <p className="path-text">Data: {status?.data_file ? status.data_file.split('/').pop() : "..."}</p>
             <p className="path-text">
-              Managed: {data?.settings.managed_directory ? data.settings.managed_directory.split('/').pop() : "Not set"}
+              {data?.settings.workspace_root
+                ? `Workspace: ${data.settings.workspace_root.split('/').pop()}`
+                : `Managed: ${data?.settings.managed_directory ? data.settings.managed_directory.split('/').pop() : "Not set"}`}
             </p>
             <p>{message}</p>
           </div>
@@ -1052,9 +1821,10 @@ function App() {
         <section className="panel bridge-panel">
           <div className="storage-info">
             <h2>Storage</h2>
-            <p className="path-text">Data: {status?.data_file ? status.data_file.split('/').pop() : "..."}</p>
             <p className="path-text">
-              Managed: {data?.settings.managed_directory ? data.settings.managed_directory.split('/').pop() : "Not set"}
+              {data?.settings.workspace_root
+                ? `Workspace: ${data.settings.workspace_root.split('/').pop()}`
+                : `Managed: ${data?.settings.managed_directory ? data.settings.managed_directory.split('/').pop() : "Not set"}`}
             </p>
             <p>{message}</p>
           </div>
@@ -1073,39 +1843,37 @@ function App() {
         <form className="panel registration-form" onSubmit={registerPaper}>
           <div className="section-heading">
             <h2>Register paper</h2>
-            <p>Fetch metadata when needed, then register and organize the paper in one step.</p>
+            <p>Paste a DOI, arXiv ID, or paper URL to fetch metadata and import available PDFs.</p>
           </div>
 
-          <div className="field-row">
-            <label>
-              DOI
-              <input
-                value={form.doi}
-                onChange={(event) => updateForm("doi", event.currentTarget.value)}
-                placeholder="10.1103/..."
-              />
-            </label>
-            <label>
-              arXiv ID
-              <input
-                value={form.arxiv_id}
-                onChange={(event) => updateForm("arxiv_id", event.currentTarget.value)}
-                placeholder="2401.00000"
-              />
-            </label>
-          </div>
+          <label>
+            Paper ID or URL
+            <input
+              value={importSource}
+              onChange={(event) => setImportSource(event.currentTarget.value)}
+              placeholder="10.1103/... or 2401.00000 or https://arxiv.org/abs/..."
+            />
+          </label>
 
           <div className="form-action-row">
             <button
               type="button"
               className="secondary-action"
-              disabled={metadataLoading || !metadataKey(form)}
-              onClick={fetchMetadataForRegistration}
+              disabled={metadataLoading || !importSource.trim()}
+              onClick={resolvePaperImport}
             >
               {metadataLoading ? "Fetching..." : "Fetch metadata"}
             </button>
-            <button type="submit" className="primary-action">
-              Register paper
+            <button
+              type="button"
+              className="primary-action"
+              disabled={metadataLoading || !importSource.trim()}
+              onClick={fetchAndRegisterPaper}
+            >
+              Fetch and register
+            </button>
+            <button type="submit" className="secondary-action">
+              Register manually
             </button>
           </div>
 
@@ -1141,134 +1909,170 @@ function App() {
             </div>
           </label>
 
-          <label>
-            Title
-            <input
-              value={form.title}
-              onChange={(event) => updateForm("title", event.currentTarget.value)}
-              placeholder="Paper title"
-            />
-          </label>
+          <details className="advanced-details">
+            <summary>Advanced details</summary>
 
-          <label>
-            Authors
-            <input
-              value={form.authors}
-              onChange={(event) => updateForm("authors", event.currentTarget.value)}
-              placeholder="First Author, Second Author"
-            />
-          </label>
+            <div className="advanced-details-body">
+              <div className="field-row">
+                <label>
+                  DOI
+                  <input
+                    value={form.doi}
+                    onChange={(event) => updateForm("doi", event.currentTarget.value)}
+                    placeholder="10.1103/..."
+                  />
+                </label>
+                <label>
+                  arXiv ID
+                  <input
+                    value={form.arxiv_id}
+                    onChange={(event) => updateForm("arxiv_id", event.currentTarget.value)}
+                    placeholder="2401.00000"
+                  />
+                </label>
+              </div>
 
-          <div className="field-row">
-            <label>
-              Year
-              <input
-                inputMode="numeric"
-                value={form.year}
-                onChange={(event) => updateForm("year", event.currentTarget.value)}
-                placeholder="2026"
-              />
-            </label>
-            <label>
-              Status
-              <select
-                value={form.status}
-                onChange={(event) => updateForm("status", event.currentTarget.value)}
-              >
-                <option value="unread">Unread</option>
-                <option value="reading">Reading</option>
-                <option value="done">Done</option>
-              </select>
-            </label>
-          </div>
+              <div className="form-action-row compact-action-row">
+                <button
+                  type="button"
+                  className="secondary-action"
+                  disabled={metadataLoading || !metadataKey(form)}
+                  onClick={fetchMetadataForRegistration}
+                >
+                  {metadataLoading ? "Fetching..." : "Fetch from DOI/arXiv fields"}
+                </button>
+              </div>
 
-          <label>
-            Journal / publication
-            <input
-              value={form.publication}
-              onChange={(event) => updateForm("publication", event.currentTarget.value)}
-              placeholder="Phys. Rev. X"
-            />
-          </label>
+              <label>
+                Title
+                <input
+                  value={form.title}
+                  onChange={(event) => updateForm("title", event.currentTarget.value)}
+                  placeholder="Paper title"
+                />
+              </label>
 
-          <div className="field-row">
-            <label>
-              Volume
-              <input
-                value={form.volume}
-                onChange={(event) => updateForm("volume", event.currentTarget.value)}
-              />
-            </label>
-            <label>
-              Issue
-              <input
-                value={form.issue}
-                onChange={(event) => updateForm("issue", event.currentTarget.value)}
-              />
-            </label>
-          </div>
+              <label>
+                Authors
+                <input
+                  value={form.authors}
+                  onChange={(event) => updateForm("authors", event.currentTarget.value)}
+                  placeholder="First Author, Second Author"
+                />
+              </label>
 
-          <div className="field-row">
-            <label>
-              Pages
-              <input
-                value={form.pages}
-                onChange={(event) => updateForm("pages", event.currentTarget.value)}
-              />
-            </label>
-            <label>
-              Number of pages
-              <input
-                inputMode="numeric"
-                value={form.numpages}
-                onChange={(event) => updateForm("numpages", event.currentTarget.value)}
-              />
-            </label>
-          </div>
+              <div className="field-row">
+                <label>
+                  Year
+                  <input
+                    inputMode="numeric"
+                    value={form.year}
+                    onChange={(event) => updateForm("year", event.currentTarget.value)}
+                    placeholder="2026"
+                  />
+                </label>
+                <label>
+                  Status
+                  <select
+                    value={form.status}
+                    onChange={(event) => updateForm("status", event.currentTarget.value)}
+                  >
+                    <option value="unread">Unread</option>
+                    <option value="reading">Reading</option>
+                    <option value="done">Done</option>
+                  </select>
+                </label>
+              </div>
 
-          <div className="field-row">
-            <label>
-              Month
-              <input
-                value={form.month}
-                onChange={(event) => updateForm("month", event.currentTarget.value)}
-              />
-            </label>
-            <label>
-              Publisher
-              <input
-                value={form.publisher}
-                onChange={(event) => updateForm("publisher", event.currentTarget.value)}
-              />
-            </label>
-          </div>
+              <label>
+                Journal / publication
+                <input
+                  value={form.publication}
+                  onChange={(event) => updateForm("publication", event.currentTarget.value)}
+                  placeholder="Phys. Rev. X"
+                />
+              </label>
 
-          <label>
-            URL
-            <input
-              value={form.url}
-              onChange={(event) => updateForm("url", event.currentTarget.value)}
-              placeholder="https://..."
-            />
-          </label>
+              <div className="field-row">
+                <label>
+                  Volume
+                  <input
+                    value={form.volume}
+                    onChange={(event) => updateForm("volume", event.currentTarget.value)}
+                  />
+                </label>
+                <label>
+                  Issue
+                  <input
+                    value={form.issue}
+                    onChange={(event) => updateForm("issue", event.currentTarget.value)}
+                  />
+                </label>
+              </div>
 
-          <label>
-            Abstract
-            <textarea
-              value={form.abstract_text}
-              onChange={(event) => updateForm("abstract_text", event.currentTarget.value)}
-              placeholder="Abstract"
-            />
-          </label>
+              <div className="field-row">
+                <label>
+                  Pages
+                  <input
+                    value={form.pages}
+                    onChange={(event) => updateForm("pages", event.currentTarget.value)}
+                  />
+                </label>
+                <label>
+                  Number of pages
+                  <input
+                    inputMode="numeric"
+                    value={form.numpages}
+                    onChange={(event) => updateForm("numpages", event.currentTarget.value)}
+                  />
+                </label>
+              </div>
 
-          <label>
-            Tags
-            <input
-              value={form.tags}
-              onChange={(event) => updateForm("tags", event.currentTarget.value)}
-              placeholder="magnetism, spintronics"
-            />
-          </label>
+              <div className="field-row">
+                <label>
+                  Month
+                  <input
+                    value={form.month}
+                    onChange={(event) => updateForm("month", event.currentTarget.value)}
+                  />
+                </label>
+                <label>
+                  Publisher
+                  <input
+                    value={form.publisher}
+                    onChange={(event) => updateForm("publisher", event.currentTarget.value)}
+                  />
+                </label>
+              </div>
+
+              <label>
+                URL
+                <input
+                  value={form.url}
+                  onChange={(event) => updateForm("url", event.currentTarget.value)}
+                  placeholder="https://..."
+                />
+              </label>
+
+              <label>
+                Abstract
+                <textarea
+                  value={form.abstract_text}
+                  onChange={(event) => updateForm("abstract_text", event.currentTarget.value)}
+                  placeholder="Abstract"
+                />
+              </label>
+
+              <label>
+                Tags
+                <input
+                  value={form.tags}
+                  onChange={(event) => updateForm("tags", event.currentTarget.value)}
+                  placeholder="magnetism, spintronics"
+                />
+              </label>
+            </div>
+          </details>
 
         </form>
       </section>
@@ -1289,9 +2093,10 @@ function App() {
         <section className="panel bridge-panel">
           <div className="storage-info">
             <h2>Storage</h2>
-            <p className="path-text">Data: {status?.data_file ? status.data_file.split('/').pop() : "..."}</p>
             <p className="path-text">
-              Managed: {data?.settings.managed_directory ? data.settings.managed_directory.split('/').pop() : "Not set"}
+              {data?.settings.workspace_root
+                ? `Workspace: ${data.settings.workspace_root.split('/').pop()}`
+                : `Managed: ${data?.settings.managed_directory ? data.settings.managed_directory.split('/').pop() : "Not set"}`}
             </p>
             <p>{message}</p>
           </div>
@@ -1302,18 +2107,73 @@ function App() {
             <button type="button" className="secondary-action" onClick={openRegisterPaperWindow}>
               Register
             </button>
-            <button type="button" className="secondary-action" onClick={createBackup}>
-              Backup
-            </button>
-            <button type="button" className="secondary-action" onClick={restoreBackup}>
-              Restore
-            </button>
-            <button type="button" className="secondary-action" onClick={relinkFiles}>
-              Relink
-            </button>
             <button type="button" className="secondary-action" onClick={loadSavedData}>
               Reload
             </button>
+            <div className="utility-menu" ref={utilityMenuRef}>
+              <button
+                type="button"
+                className="utility-menu-trigger"
+                aria-expanded={utilityMenuOpen}
+                onClick={() => setUtilityMenuOpen((current) => !current)}
+              >
+                More
+              </button>
+              {utilityMenuOpen ? (
+                <div className="utility-menu-body">
+                <button
+                  type="button"
+                  className="secondary-action"
+                  onClick={() => {
+                    setUtilityMenuOpen(false);
+                    processExtensionImports();
+                  }}
+                >
+                  Import inbox
+                </button>
+                <button
+                  type="button"
+                  className="secondary-action"
+                  onClick={() => {
+                    setUtilityMenuOpen(false);
+                    checkWorkspaceHealth();
+                  }}
+                >
+                  Workspace health
+                </button>
+                <button
+                  type="button"
+                  className="secondary-action"
+                  onClick={() => {
+                    setUtilityMenuOpen(false);
+                    createBackup();
+                  }}
+                >
+                  Backup
+                </button>
+                <button
+                  type="button"
+                  className="secondary-action"
+                  onClick={() => {
+                    setUtilityMenuOpen(false);
+                    restoreBackup();
+                  }}
+                >
+                  Restore
+                </button>
+                <button
+                  type="button"
+                  className="secondary-action"
+                  onClick={() => {
+                    setUtilityMenuOpen(false);
+                    relinkFiles();
+                  }}
+                >
+                  Relink
+                </button>
+                </div>
+              ) : null}
+            </div>
           </div>
         </section>
 
@@ -1393,6 +2253,14 @@ function App() {
                 <button type="button" className="text-button" onClick={() => setSelectedIds([])}>
                   Clear
                 </button>
+                <button
+                  type="button"
+                  className="danger-action"
+                  disabled={selectedIds.length === 0}
+                  onClick={() => deletePapers(selectedIds)}
+                >
+                  Delete selected
+                </button>
               </div>
 
               {allPapers.length === 0 ? (
@@ -1420,6 +2288,7 @@ function App() {
                         type="button"
                         className="compact-paper-title"
                         onClick={() => setFocusedPaperId(paper.id)}
+                        onDoubleClick={() => openPaperPdf(paper.id)}
                       >
                         {paper.title}
                       </button>
@@ -1437,6 +2306,17 @@ function App() {
                 <p>{selectedIds.length} papers selected.</p>
               </div>
               <div className="bibtex-toolbar">
+                <label className="inline-select-label">
+                  Journal
+                  <select
+                    value={bibtexJournalStyle}
+                    onChange={(event) => setBibtexJournalStyle(event.currentTarget.value)}
+                  >
+                    <option value="as_stored">As stored</option>
+                    <option value="full">Full name</option>
+                    <option value="abbreviation">Abbreviation</option>
+                  </select>
+                </label>
                 <button type="button" onClick={generateSelectedBibtex}>
                   Generate
                 </button>
@@ -1471,6 +2351,13 @@ function App() {
                       onClick={() => openEditPaperWindow(focusedPaper.id)}
                     >
                       Edit
+                    </button>
+                    <button
+                      type="button"
+                      className="danger-action"
+                      onClick={() => deletePapers([focusedPaper.id])}
+                    >
+                      Delete
                     </button>
                   </div>
                   <div className="paper-title-row">
