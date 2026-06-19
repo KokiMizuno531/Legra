@@ -39,11 +39,32 @@ The Chrome extension only works with pages and PDFs that the user can legitimate
 
 ## Requirements
 
-- macOS
+- macOS 11 or later
+- Homebrew for the recommended install path
+
+Development also requires:
+
 - Node.js and npm
 - Rust toolchain
 - Tauri prerequisites for macOS
 - Chrome or a Chromium-based browser for the optional extension
+
+## Install
+
+Install Legra with Homebrew:
+
+```sh
+brew tap KokiMizuno531/legra
+brew install --cask legra
+```
+
+Open Legra:
+
+```sh
+open -a Legra
+```
+
+The Chrome extension is not distributed through Homebrew yet. To use Chrome import, load `chrome-extension/` as an unpacked Chrome extension, copy its extension ID, paste it into `Settings -> Chrome extension ID`, and click `Install Native Host`.
 
 ## Development
 
@@ -120,14 +141,16 @@ Shared workspaces are intentionally lightweight. If another machine changes the 
 
 ## Releases and Homebrew
 
-Tagged releases such as `v0.1.0` run the GitHub Actions release workflow. The workflow builds the macOS app bundle, uploads the generated `.dmg` or `.zip` files as draft release assets, and writes `SHA256SUMS.txt`.
+Tagged releases such as `v0.1.0` run the GitHub Actions release workflow. The workflow builds the macOS app bundle, uploads the generated `.app.zip` file as a release asset, and writes `SHA256SUMS.txt`.
 
-A starter Homebrew cask is available in [Packaging/homebrew](Packaging/homebrew). For the first public install path, use a personal tap:
+The public Homebrew tap is:
 
 ```sh
-brew tap OWNER/legra
+brew tap KokiMizuno531/legra
 brew install --cask legra
 ```
+
+A copy of the cask is also kept in [Packaging/homebrew](Packaging/homebrew) for reference.
 
 After installing from Homebrew, open Legra, set the Chrome extension ID in Settings, and click `Install Native Host` to enable Chrome import.
 
