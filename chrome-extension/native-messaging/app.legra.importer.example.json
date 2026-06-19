@@ -1,0 +1,9 @@
+{
+  "name": "app.legra.importer",
+  "description": "Legra Chrome import native host",
+  "path": "/ABSOLUTE/PATH/TO/paper_manager_native_host",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://REPLACE_WITH_EXTENSION_ID/"
+  ]
+}

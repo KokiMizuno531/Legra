@@ -8,9 +8,17 @@ src-tauri/gen
 # Frontend dependencies and build output
 node_modules
 dist
+release-assets
 
 # Local app data generated during development
 setting
+src-tauri/setting
+src-tauri/release-resources
+
+# Local Chrome Native Messaging manifests
+chrome-extension/native-messaging/app.legra.importer.json
+chrome-extension/native-messaging/com.mizuno.paper_manager.json
+!chrome-extension/native-messaging/app.legra.importer.example.json
 
 # macOS
 .DS_Store

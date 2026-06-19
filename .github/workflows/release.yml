@@ -1,0 +1,70 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Chrome native host resource
+        run: |
+          cd src-tauri
+          cargo build --release --bin paper_manager_native_host
+          mkdir -p release-resources
+          cp target/release/paper_manager_native_host release-resources/paper_manager_native_host
+
+      - name: Build Legra app bundle
+        run: npm run tauri build -- --bundles app --config '{"bundle":{"resources":["release-resources/paper_manager_native_host"]}}'
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release-assets
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="$(node -p "require('./package.json').version")"
+          fi
+          ARCH="$(rustc -vV | awk '/host:/ {print $2}' | cut -d '-' -f 1)"
+          ditto -c -k --sequesterRsrc --keepParent \
+            src-tauri/target/release/bundle/macos/Legra.app \
+            "release-assets/Legra_${VERSION}_${ARCH}.app.zip"
+          cd release-assets
+          env LC_ALL=C LANG=C shasum -a 256 * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: legra-macos
+          path: release-assets/*
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          draft: true
+          generate_release_notes: true

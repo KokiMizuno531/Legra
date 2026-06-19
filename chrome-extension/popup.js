@@ -5,7 +5,8 @@ const titleEl = document.getElementById("title");
 const doiEl = document.getElementById("doi");
 const arxivEl = document.getElementById("arxiv");
 const pdfEl = document.getElementById("pdf");
-const categoryEl = document.getElementById("category");
+const categorySelectEl = document.getElementById("categorySelect");
+const categoryNewEl = document.getElementById("categoryNew");
 const importButton = document.getElementById("import");
 
 function setStatus(message) {
@@ -19,6 +20,38 @@ function renderDetection(result) {
   arxivEl.textContent = result.arxiv_id || "-";
   pdfEl.textContent = result.pdf_url ? "available" : "-";
   importButton.disabled = !(result.doi || result.arxiv_id || result.pdf_url);
+}
+
+function renderCategories(categories) {
+  categorySelectEl.replaceChildren();
+
+  const emptyOption = document.createElement("option");
+  emptyOption.value = "";
+  emptyOption.textContent = "No category";
+  categorySelectEl.appendChild(emptyOption);
+
+  for (const category of categories) {
+    const option = document.createElement("option");
+    option.value = category;
+    option.textContent = category;
+    categorySelectEl.appendChild(option);
+  }
+}
+
+async function loadCategories() {
+  try {
+    const result = await chrome.runtime.sendMessage({ action: "list_categories" });
+    if (!result.ok) {
+      throw new Error(result.message);
+    }
+    renderCategories(result.categories || []);
+  } catch (_) {
+    setStatus("Could not load categories. Import still works.");
+  }
+}
+
+function selectedCategory() {
+  return categoryNewEl.value.trim() || categorySelectEl.value.trim();
 }
 
 async function detectCurrentTab() {
@@ -42,7 +75,7 @@ async function importCurrentTab() {
   try {
     const result = await chrome.runtime.sendMessage({
       action: "import_current_tab",
-      category: categoryEl.value.trim(),
+      category: selectedCategory(),
       detected,
     });
     if (!result.ok) {
@@ -58,7 +91,15 @@ async function importCurrentTab() {
 }
 
 importButton.addEventListener("click", importCurrentTab);
-categoryEl.addEventListener("keydown", (event) => {
+categorySelectEl.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter" || importButton.disabled) {
+    return;
+  }
+
+  event.preventDefault();
+  importCurrentTab();
+});
+categoryNewEl.addEventListener("keydown", (event) => {
   if (event.key !== "Enter" || importButton.disabled) {
     return;
   }
@@ -67,4 +108,5 @@ categoryEl.addEventListener("keydown", (event) => {
   importCurrentTab();
 });
 
+loadCategories();
 detectCurrentTab();

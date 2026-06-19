@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "paper-manager importer",
+  "name": "Legra importer",
   "version": "0.1.0",
-  "description": "Import DOI, arXiv, and accessible PDF files into paper-manager.",
+  "description": "Import DOI, arXiv, and accessible PDF files into Legra.",
   "permissions": [
     "activeTab",
     "downloads",
@@ -16,7 +16,7 @@
   ],
   "action": {
     "default_popup": "popup.html",
-    "default_title": "Import to paper-manager"
+    "default_title": "Import to Legra"
   },
   "background": {
     "service_worker": "service_worker.js"

@@ -1,21 +1,166 @@
-# paper-manager
+# Legra
 
-macOS 向けの論文管理デスクトップアプリです。Tauri + React を基盤に、論文メタデータ、Markdown ノート、PDF パス、BibTeX 出力用情報をローカル JSON で管理します。
+Legra is a local-first desktop app for managing research papers, PDFs, Markdown notes, and BibTeX exports.
+
+It is built with Tauri, React, and Rust. The app is designed for researchers who want their paper library to stay as ordinary files on disk instead of being locked inside a cloud service.
+
+## Features
+
+- Register papers from DOI, arXiv ID, paper URLs, or manual metadata.
+- Organize PDFs into a managed directory with configurable filename rules.
+- Keep linked Markdown notes and open them in an external editor such as MarkText.
+- Export selected papers as BibTeX.
+- Configure BibTeX citation key rules.
+- Normalize journal names at export time using editable journal aliases.
+- Import metadata and accessible PDFs from Chrome via a companion extension.
+- Create shared workspaces in Google Drive, Dropbox, iCloud Drive, or any synced folder.
+- Keep PDFs and notes as regular files that can be backed up or inspected without Legra.
+
+## Philosophy
+
+Legra is not a Zotero or Mendeley replacement. It focuses on a smaller workflow:
+
+- local files first
+- transparent folder structure
+- Markdown notes
+- lightweight BibTeX export
+- no account requirement
+- no publisher authentication bypass
+
+The Chrome extension only works with pages and PDFs that the user can legitimately access in their browser.
+
+## Current Limitations
+
+- macOS is the primary supported platform.
+- PDF annotation is not built in.
+- Word, LibreOffice, and Google Docs citation plugins are not included.
+- Shared workspaces use regular file sync. They detect conflicting saves but do not merge simultaneous edits.
+- Chrome Native Messaging setup is manual during development.
+
+## Requirements
+
+- macOS
+- Node.js and npm
+- Rust toolchain
+- Tauri prerequisites for macOS
+- Chrome or a Chromium-based browser for the optional extension
 
 ## Development
 
+Install dependencies:
+
 ```sh
 npm install
-npm run build
+```
+
+Run the app in development mode:
+
+```sh
 npm run tauri dev
 ```
 
-## Phase 1 scope
+Basic workflow:
 
-- React UI から Rust command を呼び出す
-- `Paper` / `Note` / `Settings` の基本型を Rust 側に定義する
-- アプリ実行ディレクトリ配下の `setting/app-data.json` にサンプル JSON を保存・読み込みする
+1. Open Legra and set a managed directory from the storage controls.
+2. Register a paper from a DOI, arXiv ID, or paper URL.
+3. Choose a category to organize the PDF into folders.
+4. Link or create Markdown notes for the paper.
+5. Export selected papers as BibTeX when needed.
 
+Build the frontend:
 
-## check
-npm run tauri dev
+```sh
+npm run build
+```
+
+Check the Rust backend:
+
+```sh
+cd src-tauri
+cargo check
+cargo check --bin paper_manager_native_host
+```
+
+## Chrome Extension
+
+The optional Chrome extension lives in `chrome-extension/`.
+
+It can detect DOI/arXiv metadata on the current page, download accessible PDFs when possible, and queue an import request through Chrome Native Messaging.
+
+See [chrome-extension/README.md](chrome-extension/README.md) for setup instructions.
+
+During development, load the extension as an unpacked extension and paste its extension ID into `Settings -> Chrome extension ID`. Then click `Install Native Host` in Settings. Legra writes the Chrome Native Messaging manifest to the user-level Chrome configuration directory.
+
+After changing the native host code, rebuild it before testing Chrome import:
+
+```sh
+cd src-tauri
+cargo build --bin paper_manager_native_host
+```
+
+For packaged releases, the same Settings action is intended to install or refresh the Native Messaging manifest after Legra is installed.
+
+## Shared Workspaces
+
+Legra can create a shared workspace in a synced folder such as Google Drive, Dropbox, or iCloud Drive.
+
+The workspace contains:
+
+```text
+paper-manager-workspace.json
+papers/
+notes/
+exports/
+.paper-manager/
+```
+
+The `paper-manager` names are kept for compatibility with earlier development versions. They may be migrated in a future release.
+
+Shared workspaces are intentionally lightweight. If another machine changes the workspace before your save, Legra stops the write and asks you to reload instead of silently overwriting collaborator changes.
+
+## Releases and Homebrew
+
+Tagged releases such as `v0.1.0` run the GitHub Actions release workflow. The workflow builds the macOS app bundle, uploads the generated `.dmg` or `.zip` files as draft release assets, and writes `SHA256SUMS.txt`.
+
+A starter Homebrew cask is available in [Packaging/homebrew](Packaging/homebrew). For the first public install path, use a personal tap:
+
+```sh
+brew tap OWNER/legra
+brew install --cask legra
+```
+
+After installing from Homebrew, open Legra, set the Chrome extension ID in Settings, and click `Install Native Host` to enable Chrome import.
+
+## Repository Safety
+
+Do not commit:
+
+- generated `dist/`
+- `node_modules/`
+- `src-tauri/target/`
+- local app data under `setting/`
+- personal Chrome Native Messaging manifests
+
+Use `chrome-extension/native-messaging/app.legra.importer.example.json` as the template for local setup.
+
+## Verification
+
+Before opening a pull request, run:
+
+```sh
+npm run build
+cd src-tauri
+cargo check
+cargo check --bin paper_manager_native_host
+```
+
+For Chrome extension changes:
+
+```sh
+node --check chrome-extension/service_worker.js
+node --check chrome-extension/popup.js
+```
+
+## License
+
+MIT

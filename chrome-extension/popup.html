@@ -2,13 +2,13 @@
 <html>
   <head>
     <meta charset="utf-8" />
-    <title>paper-manager importer</title>
+    <title>Legra importer</title>
     <link rel="stylesheet" href="popup.css" />
   </head>
   <body>
     <main>
       <header>
-        <h1>paper-manager</h1>
+        <h1>Legra</h1>
         <p id="status">Inspecting current tab...</p>
       </header>
 
@@ -25,12 +25,21 @@
         </dl>
       </section>
 
-      <label>
-        Folder category
-        <input id="category" placeholder="optional/category" />
-      </label>
+      <section class="category-panel">
+        <label>
+          Existing category
+          <select id="categorySelect">
+            <option value="">No category</option>
+          </select>
+        </label>
 
-      <button id="import" type="button">Import to paper-manager</button>
+        <label>
+          New category
+          <input id="categoryNew" placeholder="optional/category" />
+        </label>
+      </section>
+
+      <button id="import" type="button">Import to Legra</button>
     </main>
     <script src="popup.js"></script>
   </body>

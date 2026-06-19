@@ -13,6 +13,7 @@ use tauri::{
 };
 
 const SETTINGS_MENU_ID: &str = "settings";
+const CHROME_NATIVE_HOST_NAME: &str = "app.legra.importer";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Paper {
@@ -119,6 +120,7 @@ struct UpdateSettingsInput {
     marktext_path: Option<String>,
     pdf_viewer_path: Option<String>,
     chrome_import_directory: Option<String>,
+    chrome_extension_id: Option<String>,
     filename_rule: String,
     bibtex_key_rule: String,
     bibtex_export_rule: String,
@@ -146,6 +148,11 @@ struct RelinkInput {
 #[derive(Debug, Deserialize)]
 struct WorkspaceInput {
     workspace_dir: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChromeNativeHostInput {
+    extension_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -220,6 +227,15 @@ struct WorkspaceHealth {
 }
 
 #[derive(Debug, Serialize)]
+struct ChromeNativeHostStatus {
+    installed: bool,
+    manifest_path: String,
+    host_path: String,
+    extension_id: String,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
 struct NoteStatus {
     note_id: String,
     exists: bool,
@@ -240,6 +256,8 @@ struct Settings {
     pdf_viewer_path: Option<String>,
     #[serde(default)]
     chrome_import_directory: Option<String>,
+    #[serde(default)]
+    chrome_extension_id: Option<String>,
     #[serde(default = "default_bibtex_key_rule")]
     bibtex_key_rule: String,
     #[serde(default = "default_bibtex_export_rule")]
@@ -311,8 +329,35 @@ fn app_root_dir() -> Result<PathBuf, String> {
         .ok_or_else(|| "Could not resolve application directory".to_string())
 }
 
-fn setting_dir() -> Result<PathBuf, String> {
+fn default_setting_dir() -> Result<PathBuf, String> {
+    if let Ok(path) = std::env::var("LEGRA_SETTING_DIR") {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            return Ok(PathBuf::from(trimmed));
+        }
+    }
+
+    let home = std::env::var("HOME").map_err(|_| "Could not resolve HOME directory.".to_string())?;
+    Ok(PathBuf::from(home)
+        .join("Library")
+        .join("Application Support")
+        .join("Legra"))
+}
+
+fn legacy_setting_dir() -> Result<PathBuf, String> {
     Ok(app_root_dir()?.join("setting"))
+}
+
+fn setting_dir() -> Result<PathBuf, String> {
+    let default_dir = default_setting_dir()?;
+    let legacy_dir = legacy_setting_dir()?;
+    let default_data = default_dir.join("app-data.json");
+    let legacy_data = legacy_dir.join("app-data.json");
+    if legacy_data.exists() && !default_data.exists() {
+        return Ok(legacy_dir);
+    }
+
+    Ok(default_dir)
 }
 
 fn data_file_path() -> Result<PathBuf, String> {
@@ -404,6 +449,69 @@ fn extension_import_processed_dir() -> Result<PathBuf, String> {
 
 fn extension_import_failed_dir() -> Result<PathBuf, String> {
     Ok(extension_import_root_dir()?.join("failed"))
+}
+
+fn chrome_native_host_manifest_path() -> Result<PathBuf, String> {
+    let home = std::env::var("HOME").map_err(|_| "Could not resolve HOME directory.".to_string())?;
+    Ok(PathBuf::from(home)
+        .join("Library")
+        .join("Application Support")
+        .join("Google")
+        .join("Chrome")
+        .join("NativeMessagingHosts")
+        .join(format!("{CHROME_NATIVE_HOST_NAME}.json")))
+}
+
+fn chrome_native_host_binary_path() -> Result<PathBuf, String> {
+    let app_dir = app_root_dir()?;
+    let same_dir = app_dir.join("paper_manager_native_host");
+    if same_dir.exists() {
+        return Ok(same_dir);
+    }
+
+    let bundled_resource = app_dir
+        .join("..")
+        .join("Resources")
+        .join("paper_manager_native_host");
+    if bundled_resource.exists() {
+        return fs::canonicalize(&bundled_resource).map_err(|error| error.to_string());
+    }
+
+    let development_path = app_dir
+        .join("..")
+        .join("debug")
+        .join("paper_manager_native_host");
+    if development_path.exists() {
+        return fs::canonicalize(&development_path).map_err(|error| error.to_string());
+    }
+
+    Ok(same_dir)
+}
+
+fn normalize_chrome_extension_id(value: Option<String>) -> Result<String, String> {
+    let extension_id = value
+        .or_else(|| {
+            load_or_default_app_data()
+                .ok()
+                .and_then(|data| data.settings.chrome_extension_id)
+        })
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+
+    if extension_id.is_empty() {
+        return Err("Enter the Chrome extension ID before installing the Native Host.".to_string());
+    }
+
+    if extension_id.len() != 32
+        || !extension_id
+            .chars()
+            .all(|character| matches!(character, 'a'..='p'))
+    {
+        return Err("Chrome extension ID must be 32 lowercase characters from a to p.".to_string());
+    }
+
+    Ok(extension_id)
 }
 
 fn ensure_setting_dir() -> Result<PathBuf, String> {
@@ -588,6 +696,7 @@ fn default_settings(timestamp: &str) -> Settings {
         marktext_path: None,
         pdf_viewer_path: None,
         chrome_import_directory: None,
+        chrome_extension_id: None,
         bibtex_key_rule: default_bibtex_key_rule(),
         bibtex_export_rule: default_bibtex_export_rule(),
         journal_output_style: default_journal_output_style(),
@@ -2593,7 +2702,7 @@ fn open_settings_window(app: tauri::AppHandle) -> Result<(), String> {
     .map_err(|error| error.to_string())?;
 
     window
-        .set_title("paper-manager settings")
+        .set_title("Legra settings")
         .map_err(|error| error.to_string())?;
     window.show().map_err(|error| error.to_string())?;
     window.set_focus().map_err(|error| error.to_string())?;
@@ -2770,6 +2879,10 @@ fn update_settings(app: tauri::AppHandle, input: UpdateSettingsInput) -> Result<
     let note_directory = validate_optional_directory(&input.note_directory, "Note directory")?;
     let chrome_import_directory =
         validate_optional_directory(&input.chrome_import_directory, "Chrome import directory")?;
+    let chrome_extension_id = normalize_optional(input.chrome_extension_id);
+    if let Some(extension_id) = chrome_extension_id.as_deref() {
+        normalize_chrome_extension_id(Some(extension_id.to_string()))?;
+    }
     let marktext_path = validate_optional_app_path(&input.marktext_path, "MarkText path")?;
     let pdf_viewer_path = validate_optional_app_path(&input.pdf_viewer_path, "PDF viewer path")?;
 
@@ -2782,6 +2895,7 @@ fn update_settings(app: tauri::AppHandle, input: UpdateSettingsInput) -> Result<
     data.settings.managed_directory = managed_directory;
     data.settings.note_directory = note_directory;
     data.settings.chrome_import_directory = chrome_import_directory;
+    data.settings.chrome_extension_id = chrome_extension_id;
     data.settings.marktext_path = marktext_path;
     data.settings.pdf_viewer_path = pdf_viewer_path;
     data.settings.filename_rule = filename_rule.to_string();
@@ -2813,6 +2927,83 @@ fn update_settings(app: tauri::AppHandle, input: UpdateSettingsInput) -> Result<
     save_data_file(&data)?;
     let _ = app.emit("paper-manager:data-updated", ());
     Ok(data)
+}
+
+fn chrome_native_host_status_for(extension_id: String) -> Result<ChromeNativeHostStatus, String> {
+    let manifest_path = chrome_native_host_manifest_path()?;
+    let host_path = chrome_native_host_binary_path()?;
+    let installed = manifest_path.exists();
+    let message = if installed {
+        "Chrome Native Host manifest is installed.".to_string()
+    } else {
+        "Chrome Native Host manifest is not installed.".to_string()
+    };
+
+    Ok(ChromeNativeHostStatus {
+        installed,
+        manifest_path: manifest_path.to_string_lossy().into_owned(),
+        host_path: host_path.to_string_lossy().into_owned(),
+        extension_id,
+        message,
+    })
+}
+
+#[tauri::command]
+fn check_chrome_native_host(
+    input: Option<ChromeNativeHostInput>,
+) -> Result<ChromeNativeHostStatus, String> {
+    let extension_id = normalize_chrome_extension_id(input.and_then(|input| input.extension_id))?;
+    chrome_native_host_status_for(extension_id)
+}
+
+#[tauri::command]
+fn install_chrome_native_host(
+    input: ChromeNativeHostInput,
+) -> Result<ChromeNativeHostStatus, String> {
+    let extension_id = normalize_chrome_extension_id(input.extension_id)?;
+    let manifest_path = chrome_native_host_manifest_path()?;
+    let host_path = chrome_native_host_binary_path()?;
+    if !host_path.exists() {
+        return Err(format!(
+            "Chrome Native Host binary was not found at {}. Build or install Legra first.",
+            host_path.to_string_lossy()
+        ));
+    }
+
+    if let Some(parent) = manifest_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+
+    let manifest = serde_json::json!({
+        "name": CHROME_NATIVE_HOST_NAME,
+        "description": "Legra Chrome import native host",
+        "path": host_path.to_string_lossy(),
+        "type": "stdio",
+        "allowed_origins": [format!("chrome-extension://{extension_id}/")]
+    });
+    let json = serde_json::to_string_pretty(&manifest).map_err(|error| error.to_string())?;
+    fs::write(&manifest_path, json).map_err(|error| error.to_string())?;
+
+    Ok(ChromeNativeHostStatus {
+        installed: true,
+        manifest_path: manifest_path.to_string_lossy().into_owned(),
+        host_path: host_path.to_string_lossy().into_owned(),
+        extension_id,
+        message: "Chrome Native Host manifest installed.".to_string(),
+    })
+}
+
+#[tauri::command]
+fn uninstall_chrome_native_host() -> Result<ChromeNativeHostStatus, String> {
+    let extension_id = normalize_chrome_extension_id(None)?;
+    let manifest_path = chrome_native_host_manifest_path()?;
+    if manifest_path.exists() {
+        fs::remove_file(&manifest_path).map_err(|error| error.to_string())?;
+    }
+
+    let mut status = chrome_native_host_status_for(extension_id)?;
+    status.message = "Chrome Native Host manifest removed.".to_string();
+    Ok(status)
 }
 
 #[tauri::command]
@@ -2931,7 +3122,7 @@ fn create_backup(input: BackupInput) -> Result<BackupResult, String> {
 
     fs::write(
         backup_dir.join("README.md"),
-        "# paper-manager backup\n\nSelect this directory with Restore backup.\n",
+        "# Legra backup\n\nSelect this directory with Restore backup.\n",
     )
     .map_err(|error| error.to_string())?;
 
@@ -3307,7 +3498,7 @@ pub fn run() {
         .menu(|app| {
             let app_menu = Submenu::with_items(
                 app,
-                "paper-manager",
+                "Legra",
                 true,
                 &[
                     &PredefinedMenuItem::about(app, None, None)?,
@@ -3371,6 +3562,9 @@ pub fn run() {
             update_paper,
             update_managed_directory,
             update_settings,
+            check_chrome_native_host,
+            install_chrome_native_host,
+            uninstall_chrome_native_host,
             organize_paper_pdf,
             delete_papers,
             generate_bibtex,

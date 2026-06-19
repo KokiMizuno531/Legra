@@ -49,6 +49,7 @@ type AppData = {
     marktext_path?: string;
     pdf_viewer_path?: string;
     chrome_import_directory?: string;
+    chrome_extension_id?: string;
     bibtex_key_rule: string;
     bibtex_export_rule: string;
     journal_output_style: string;
@@ -139,6 +140,14 @@ type WorkspaceHealth = {
   warnings: string[];
 };
 
+type ChromeNativeHostStatus = {
+  installed: boolean;
+  manifest_path: string;
+  host_path: string;
+  extension_id: string;
+  message: string;
+};
+
 type Filters = {
   query: string;
   tag: string;
@@ -153,6 +162,7 @@ type SettingsForm = {
   marktext_path: string;
   pdf_viewer_path: string;
   chrome_import_directory: string;
+  chrome_extension_id: string;
   filename_rule: string;
   bibtex_key_rule: string;
   bibtex_export_rule: string;
@@ -198,6 +208,7 @@ const initialSettingsForm: SettingsForm = {
   marktext_path: "",
   pdf_viewer_path: "",
   chrome_import_directory: "",
+  chrome_extension_id: "",
   filename_rule: "{year}_{first_author}_{journal}.pdf",
   bibtex_key_rule: "",
   bibtex_export_rule: "doi_preferred",
@@ -294,6 +305,7 @@ function settingsToForm(settings: AppData["settings"]): SettingsForm {
     marktext_path: settings.marktext_path ?? "",
     pdf_viewer_path: settings.pdf_viewer_path ?? "",
     chrome_import_directory: settings.chrome_import_directory ?? "",
+    chrome_extension_id: settings.chrome_extension_id ?? initialSettingsForm.chrome_extension_id,
     filename_rule: settings.filename_rule || initialSettingsForm.filename_rule,
     bibtex_key_rule: settings.bibtex_key_rule ?? "",
     bibtex_export_rule: settings.bibtex_export_rule || initialSettingsForm.bibtex_export_rule,
@@ -389,6 +401,8 @@ function App() {
   const [bibtexJournalStyle, setBibtexJournalStyle] = useState(
     initialSettingsForm.journal_output_style,
   );
+  const [chromeNativeHostStatus, setChromeNativeHostStatus] =
+    useState<ChromeNativeHostStatus | null>(null);
   const [importSource, setImportSource] = useState("");
   const [metadataLoading, setMetadataLoading] = useState(false);
   const [message, setMessage] = useState("Loading saved papers...");
@@ -945,6 +959,7 @@ function App() {
           marktext_path: optionalString(settingsForm.marktext_path),
           pdf_viewer_path: optionalString(settingsForm.pdf_viewer_path),
           chrome_import_directory: optionalString(settingsForm.chrome_import_directory),
+          chrome_extension_id: optionalString(settingsForm.chrome_extension_id),
           filename_rule: settingsForm.filename_rule,
           bibtex_key_rule: settingsForm.bibtex_key_rule,
           bibtex_export_rule: settingsForm.bibtex_export_rule,
@@ -960,6 +975,46 @@ function App() {
     } catch (reason) {
       setError(String(reason));
       setMessage("Could not update settings.");
+    }
+  }
+
+  async function checkChromeNativeHostStatus() {
+    setError(null);
+    try {
+      const status = await invoke<ChromeNativeHostStatus>("check_chrome_native_host", {
+        input: { extension_id: optionalString(settingsForm.chrome_extension_id) },
+      });
+      setChromeNativeHostStatus(status);
+      setMessage(status.message);
+    } catch (reason) {
+      setError(String(reason));
+      setMessage("Could not check Chrome Native Host.");
+    }
+  }
+
+  async function installChromeNativeHost() {
+    setError(null);
+    try {
+      const status = await invoke<ChromeNativeHostStatus>("install_chrome_native_host", {
+        input: { extension_id: optionalString(settingsForm.chrome_extension_id) },
+      });
+      setChromeNativeHostStatus(status);
+      setMessage(status.message);
+    } catch (reason) {
+      setError(String(reason));
+      setMessage("Could not install Chrome Native Host.");
+    }
+  }
+
+  async function uninstallChromeNativeHost() {
+    setError(null);
+    try {
+      const status = await invoke<ChromeNativeHostStatus>("uninstall_chrome_native_host");
+      setChromeNativeHostStatus(status);
+      setMessage(status.message);
+    } catch (reason) {
+      setError(String(reason));
+      setMessage("Could not uninstall Chrome Native Host.");
     }
   }
 
@@ -1023,7 +1078,7 @@ function App() {
         ? allPapers.find((paper) => paper.id === uniqueIds[0])?.title ?? "this paper"
         : `${uniqueIds.length} papers`;
     const confirmed = window.confirm(
-      `Delete ${label} from paper-manager? PDF and note files will remain on disk.`,
+      `Delete ${label} from Legra? PDF and note files will remain on disk.`,
     );
     if (!confirmed) {
       return;
@@ -1290,7 +1345,7 @@ function App() {
         <header className="topbar">
           <div>
             <p className="eyebrow">Settings window</p>
-            <h1>paper-manager</h1>
+            <h1>Legra</h1>
           </div>
           <div className="status-pill">
             {data?.settings.updated_at ? "Settings loaded" : "Loading"}
@@ -1361,6 +1416,56 @@ function App() {
                 </button>
               </div>
             </label>
+
+            <div className="native-host-panel">
+              <label>
+                Chrome extension ID
+                <input
+                  value={settingsForm.chrome_extension_id}
+                  onChange={(event) =>
+                    updateSettingsForm("chrome_extension_id", event.currentTarget.value)
+                  }
+                  placeholder="32-character Chrome extension ID"
+                />
+              </label>
+              <div className="form-action-row compact-action-row">
+                <button
+                  type="button"
+                  className="secondary-action"
+                  onClick={checkChromeNativeHostStatus}
+                >
+                  Check Native Host
+                </button>
+                <button
+                  type="button"
+                  className="secondary-action"
+                  onClick={installChromeNativeHost}
+                >
+                  Install Native Host
+                </button>
+                <button
+                  type="button"
+                  className="danger-action"
+                  onClick={uninstallChromeNativeHost}
+                >
+                  Uninstall Native Host
+                </button>
+              </div>
+              {chromeNativeHostStatus ? (
+                <dl className="native-host-status">
+                  <dt>Status</dt>
+                  <dd>{chromeNativeHostStatus.installed ? "Installed" : "Not installed"}</dd>
+                  <dt>Manifest</dt>
+                  <dd>{chromeNativeHostStatus.manifest_path}</dd>
+                  <dt>Host</dt>
+                  <dd>{chromeNativeHostStatus.host_path}</dd>
+                </dl>
+              ) : (
+                <p className="settings-help">
+                  Install the Native Host manifest after loading the Chrome extension.
+                </p>
+              )}
+            </div>
 
             <label>
               Note directory
@@ -1594,7 +1699,7 @@ function App() {
         <header className="topbar">
           <div>
             <p className="eyebrow">Edit paper window</p>
-            <h1>paper-manager</h1>
+            <h1>Legra</h1>
           </div>
           <div className="status-pill">
             {editingPaper ? "Editing paper" : "No paper selected"}
@@ -1823,7 +1928,7 @@ function App() {
         <header className="topbar">
           <div>
             <p className="eyebrow">Register paper window</p>
-            <h1>paper-manager</h1>
+            <h1>Legra</h1>
           </div>
           <div className="status-pill">
             {status?.data_file_exists ? `${allPapers.length} papers` : "No saved data"}
@@ -2095,7 +2200,7 @@ function App() {
         <header className="topbar">
           <div>
             <p className="eyebrow">Phase 3 list search and detail editing</p>
-            <h1>paper-manager</h1>
+            <h1>Legra</h1>
           </div>
           <div className="status-pill">
             {status?.data_file_exists ? `${allPapers.length} papers` : "No saved data"}

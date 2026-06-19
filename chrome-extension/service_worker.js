@@ -1,4 +1,4 @@
-const NATIVE_HOST = "com.mizuno.paper_manager";
+const NATIVE_HOST = "app.legra.importer";
 
 function normalizeDoi(value) {
   if (!value) return "";
@@ -220,6 +220,22 @@ function sendNativeImport(request) {
   });
 }
 
+function sendNativeListCategories() {
+  return new Promise((resolve, reject) => {
+    chrome.runtime.sendNativeMessage(NATIVE_HOST, { action: "list_categories" }, (response) => {
+      if (chrome.runtime.lastError) {
+        reject(new Error(chrome.runtime.lastError.message));
+        return;
+      }
+      if (!response?.ok) {
+        reject(new Error(response?.message || "Native host rejected the category request."));
+        return;
+      }
+      resolve(response);
+    });
+  });
+}
+
 async function importCurrentTab(message) {
   const paper = message.detected || (await detectCurrentTab());
   let pdfPath = "";
@@ -257,10 +273,10 @@ async function importCurrentTab(message) {
   return {
     ok: true,
     message: pdfPath
-      ? "Queued import with downloaded PDF. Open paper-manager or click Import inbox."
+      ? "Queued import with downloaded PDF. Open Legra or click Import inbox."
       : importWarnings.length > 0
         ? "PDF download failed, but metadata import was queued."
-        : "Queued metadata import. Open paper-manager or click Import inbox.",
+        : "Queued metadata import. Open Legra or click Import inbox.",
   };
 }
 
@@ -268,6 +284,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   const run =
     message.action === "detect_current_tab"
       ? detectCurrentTab().then((paper) => ({ ok: true, paper }))
+      : message.action === "list_categories"
+        ? sendNativeListCategories()
       : message.action === "import_current_tab"
         ? importCurrentTab(message)
         : Promise.resolve({ ok: false, message: "Unknown action." });

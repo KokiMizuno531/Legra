@@ -1,10 +1,11 @@
 [package]
-name = "paper-manager"
+name = "legra"
 version = "0.1.0"
 description = "Desktop paper manager for local PDFs, notes, and BibTeX export"
 authors = ["Koki Mizuno"]
 edition = "2021"
-default-run = "paper-manager"
+license = "MIT"
+default-run = "legra"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
