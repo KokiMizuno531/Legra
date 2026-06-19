@@ -7,7 +7,7 @@ cask "legra" do
   desc "Local-first paper, PDF, note, and BibTeX manager"
   homepage "https://github.com/KokiMizuno531/Legra"
 
-  depends_on macos: ">= :big_sur"
+  depends_on macos: :big_sur
 
   app "Legra.app"
 
