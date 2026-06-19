@@ -4,9 +4,41 @@ This unpacked Chrome extension sends the current paper page to Legra through Chr
 
 It supports arXiv pages, publisher pages with DOI metadata, and PDF tabs that the user can legitimately access in Chrome. It does not bypass subscriptions, authentication, or publisher restrictions.
 
-## Build the Native Host
+## Install Legra
 
-From the repository root:
+Install and open Legra first:
+
+```sh
+brew tap KokiMizuno531/legra
+brew install --cask legra
+open -a Legra
+```
+
+The Homebrew cask includes the Chrome Native Messaging host used by this extension.
+
+## Load the Extension
+
+1. Open `chrome://extensions`.
+2. Enable Developer mode.
+3. Click `Load unpacked`.
+4. Select the `chrome-extension/` directory.
+5. Copy the generated extension ID.
+
+## Install the Native Messaging Manifest
+
+Install the Native Messaging manifest from Legra:
+
+1. Start Legra.
+2. Open `Settings`.
+3. Paste the Chrome extension ID into `Chrome extension ID`.
+4. Click `Install Native Host`.
+5. Return to `chrome://extensions` and reload the Legra extension.
+
+This writes the Native Messaging manifest into Chrome's user-specific configuration directory.
+
+## Development Setup
+
+If you are developing Legra from this repository instead of using Homebrew, build the native host first:
 
 ```sh
 cd src-tauri
@@ -19,26 +51,7 @@ The development binary is usually written to:
 src-tauri/target/debug/paper_manager_native_host
 ```
 
-## Load the Extension
-
-1. Open `chrome://extensions`.
-2. Enable Developer mode.
-3. Click `Load unpacked`.
-4. Select the `chrome-extension/` directory.
-5. Copy the generated extension ID.
-
-## Install the Native Messaging Manifest
-
-The easiest setup is from Legra:
-
-1. Start Legra.
-2. Open Settings.
-3. Paste the Chrome extension ID into `Chrome extension ID`.
-4. Click `Install Native Host`.
-
-This writes the Native Messaging manifest into Chrome's user-specific configuration directory.
-
-Manual setup is also possible:
+Manual manifest setup is also possible:
 
 Copy the template:
 
@@ -75,7 +88,8 @@ Legra polls the import inbox automatically. You can also click `More -> Import i
 ## Troubleshooting
 
 - Reload the extension after changing `service_worker.js`, `popup.js`, or the manifest.
-- Rebuild `paper_manager_native_host` after Rust changes.
+- If Legra was installed through Homebrew, open Settings and click `Install Native Host` again after changing the Chrome extension ID.
+- If Legra is running from the development repository, rebuild `paper_manager_native_host` after Rust changes.
 - If existing categories do not appear, rebuild `paper_manager_native_host`, reload the extension, and open the popup again.
 - Confirm the Native Messaging manifest path is absolute.
 - Confirm `allowed_origins` matches the Chrome extension ID.
