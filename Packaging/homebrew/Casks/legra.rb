@@ -11,6 +11,12 @@ cask "legra" do
 
   app "Legra.app"
 
+  postflight do
+    system_command "/usr/bin/xattr",
+                   args: ["-dr", "com.apple.quarantine", "#{appdir}/Legra.app"],
+                   sudo: false
+  end
+
   zap trash: [
     "~/Library/Application Support/Legra",
     "~/Library/Application Support/Google/Chrome/NativeMessagingHosts/app.legra.importer.json",
