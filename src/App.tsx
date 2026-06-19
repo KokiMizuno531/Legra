@@ -398,6 +398,7 @@ function App() {
   const editingPaper = allPapers.find((paper) => paper.id === editingId) ?? null;
   const focusedPaper = allPapers.find((paper) => paper.id === focusedPaperId) ?? null;
   const utilityMenuRef = useRef<HTMLDivElement | null>(null);
+  const importProcessingRef = useRef(false);
 
   const availableTags = useMemo(
     () => Array.from(new Set(allPapers.flatMap((paper) => paper.tags))).sort(),
@@ -469,6 +470,11 @@ function App() {
   }
 
   async function processExtensionImports(options: { silent?: boolean } = {}) {
+    if (importProcessingRef.current) {
+      return;
+    }
+
+    importProcessingRef.current = true;
     if (!options.silent) {
       setError(null);
     }
@@ -490,6 +496,8 @@ function App() {
         setError(String(reason));
         setMessage("Could not process Chrome extension imports.");
       }
+    } finally {
+      importProcessingRef.current = false;
     }
   }
 
@@ -1192,7 +1200,7 @@ function App() {
 
     const interval = window.setInterval(() => {
       processExtensionImports({ silent: true }).catch(() => {});
-    }, 5000);
+    }, 15000);
 
     return () => {
       window.clearInterval(interval);
@@ -1206,6 +1214,10 @@ function App() {
 
     let unlisten = () => {};
     listen("paper-manager:data-updated", () => {
+      if (importProcessingRef.current) {
+        return;
+      }
+
       loadSavedData().catch((reason) => {
         setError(String(reason));
         setMessage("Failed to refresh saved data.");

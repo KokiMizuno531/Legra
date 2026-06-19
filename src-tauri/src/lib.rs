@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -1606,43 +1607,45 @@ fn copy_dir_recursive(source: &Path, target: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn collect_files_by_name(root: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
+fn collect_files_by_basename(
+    root: &Path,
+    files: &mut HashMap<String, PathBuf>,
+) -> Result<(), String> {
     if !root.exists() {
         return Ok(());
     }
 
     if root.is_file() {
-        files.push(root.to_path_buf());
+        if let Some(file_name) = root.file_name().and_then(|value| value.to_str()) {
+            files
+                .entry(file_name.to_string())
+                .or_insert_with(|| root.to_path_buf());
+        }
         return Ok(());
     }
 
     for entry in fs::read_dir(root).map_err(|error| error.to_string())? {
         let entry = entry.map_err(|error| error.to_string())?;
-        collect_files_by_name(&entry.path(), files)?;
+        collect_files_by_basename(&entry.path(), files)?;
     }
 
     Ok(())
 }
 
-fn find_file_by_basename(root: &Path, original_path: &str) -> Result<Option<String>, String> {
-    let Some(file_name) = Path::new(original_path).file_name() else {
-        return Ok(None);
-    };
-
-    let mut files = Vec::new();
-    collect_files_by_name(root, &mut files)?;
-    Ok(files
-        .into_iter()
-        .find(|path| path.file_name() == Some(file_name))
-        .map(|path| path.to_string_lossy().into_owned()))
-}
-
 fn relink_paths_to_root(data: &mut AppData, root: &Path) -> Result<(), String> {
+    let mut files_by_name = HashMap::new();
+    collect_files_by_basename(root, &mut files_by_name)?;
+
     for paper in &mut data.papers {
         if let Some(pdf_path) = paper.pdf_path.as_deref() {
             if !Path::new(pdf_path).exists() {
-                if let Some(relinked) = find_file_by_basename(root, pdf_path)? {
-                    paper.pdf_path = Some(relinked);
+                if let Some(file_name) = Path::new(pdf_path)
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                {
+                    if let Some(relinked) = files_by_name.get(file_name) {
+                        paper.pdf_path = Some(relinked.to_string_lossy().into_owned());
+                    }
                 }
             }
         }
@@ -1650,8 +1653,13 @@ fn relink_paths_to_root(data: &mut AppData, root: &Path) -> Result<(), String> {
 
     for note in &mut data.notes {
         if !Path::new(&note.file_path).exists() {
-            if let Some(relinked) = find_file_by_basename(root, &note.file_path)? {
-                note.file_path = relinked;
+            if let Some(file_name) = Path::new(&note.file_path)
+                .file_name()
+                .and_then(|value| value.to_str())
+            {
+                if let Some(relinked) = files_by_name.get(file_name) {
+                    note.file_path = relinked.to_string_lossy().into_owned();
+                }
             }
         }
     }
@@ -2018,8 +2026,10 @@ fn merge_tags(existing: &mut Vec<String>, incoming: Vec<String>) {
     }
 }
 
-fn register_or_update_import_input(input: RegisterPaperInput) -> Result<AppData, String> {
-    let mut data = load_or_default_app_data()?;
+fn register_or_update_import_input_into_data(
+    data: &mut AppData,
+    input: RegisterPaperInput,
+) -> Result<String, String> {
     validate_pdf_path(&data, &input.pdf_path)?;
     let input_doi = input.doi.as_deref().map(normalize_key);
     let input_title = normalize_key(&input.title);
@@ -2031,7 +2041,61 @@ fn register_or_update_import_input(input: RegisterPaperInput) -> Result<AppData,
     });
 
     let Some(paper_index) = existing_index else {
-        return register_paper_input(input);
+        ensure_not_duplicate(data, None, &input.title, &input.doi, &input.pdf_path)?;
+        let timestamp = current_timestamp()?;
+        let pdf_path = normalize_optional(input.pdf_path);
+        let paper = Paper {
+            id: now_id()?,
+            title: input.title.trim().to_string(),
+            authors: input
+                .authors
+                .iter()
+                .map(|author| author.trim().to_string())
+                .filter(|author| !author.is_empty())
+                .collect(),
+            year: input.year,
+            publication: normalize_optional(input.publication),
+            volume: normalize_optional(input.volume),
+            issue: normalize_optional(input.issue),
+            pages: normalize_optional(input.pages),
+            numpages: input.numpages,
+            month: normalize_optional(input.month),
+            publisher: normalize_optional(input.publisher),
+            doi: normalize_optional(input.doi),
+            arxiv_id: normalize_optional(input.arxiv_id),
+            url: normalize_optional(input.url),
+            abstract_text: normalize_optional(input.abstract_text),
+            tags: input
+                .tags
+                .iter()
+                .map(|tag| tag.trim().to_string())
+                .filter(|tag| !tag.is_empty())
+                .collect(),
+            status: normalize_optional(input.status),
+            rating: None,
+            bibtex_key: None,
+            pdf_path: pdf_path.clone(),
+            original_pdf_path: pdf_path,
+            folder_category: normalize_optional(input.folder_category),
+            created_at: timestamp.clone(),
+            updated_at: timestamp,
+        };
+        if paper.title.is_empty() {
+            return Err("Title is required.".to_string());
+        }
+        if paper.authors.is_empty() {
+            return Err("At least one author is required.".to_string());
+        }
+
+        data.papers.push(paper);
+        let paper_index = data.papers.len() - 1;
+        if data.papers[paper_index].pdf_path.is_some()
+            && (data.settings.managed_directory.is_some() || data.settings.workspace_root.is_some())
+        {
+            let folder_category = data.papers[paper_index].folder_category.clone();
+            organize_pdf_for_paper(data, paper_index, folder_category)?;
+        }
+        return Ok(data.papers[paper_index].title.clone());
     };
 
     let timestamp = current_timestamp()?;
@@ -2094,11 +2158,10 @@ fn register_or_update_import_input(input: RegisterPaperInput) -> Result<AppData,
         && (data.settings.managed_directory.is_some() || data.settings.workspace_root.is_some())
     {
         let folder_category = data.papers[paper_index].folder_category.clone();
-        organize_pdf_for_paper(&mut data, paper_index, folder_category)?;
+        organize_pdf_for_paper(data, paper_index, folder_category)?;
     }
 
-    save_data_file(&data)?;
-    Ok(data)
+    Ok(data.papers[paper_index].title.clone())
 }
 
 fn metadata_for_import_request(
@@ -2305,7 +2368,10 @@ fn pending_extension_import_files() -> Result<Vec<PathBuf>, String> {
     Ok(files)
 }
 
-fn process_extension_import_file(path: &Path) -> Result<String, String> {
+fn process_extension_import_file_into_data(
+    data: &mut AppData,
+    path: &Path,
+) -> Result<String, String> {
     let json = fs::read_to_string(path).map_err(|error| error.to_string())?;
     let request: ExtensionImportRequest =
         serde_json::from_str(&json).map_err(|error| error.to_string())?;
@@ -2316,14 +2382,16 @@ fn process_extension_import_file(path: &Path) -> Result<String, String> {
         .or_else(|| request.arxiv_id.clone())
         .unwrap_or_else(|| "import request".to_string());
     let input = import_request_to_register_input(request)?;
-    let data = register_or_update_import_input(input)?;
+    let paper_title = register_or_update_import_input_into_data(data, input)?;
     move_import_file(path, &extension_import_processed_dir()?)?;
-    let paper_title = data
-        .papers
-        .last()
-        .map(|paper| paper.title.clone())
-        .unwrap_or(title_hint);
-    Ok(format!("Imported \"{paper_title}\"."))
+    Ok(format!(
+        "Imported \"{}\".",
+        if paper_title.is_empty() {
+            title_hint
+        } else {
+            paper_title
+        }
+    ))
 }
 
 fn is_extension_download_path(path: &Path) -> bool {
@@ -2441,9 +2509,10 @@ fn process_extension_imports(app: tauri::AppHandle) -> Result<ExtensionImportSum
     let mut imported = 0;
     let mut failed = 0;
     let mut messages = Vec::new();
+    let mut data = load_or_default_app_data()?;
 
-    for path in files {
-        match process_extension_import_file(&path) {
+    for path in &files {
+        match process_extension_import_file_into_data(&mut data, path) {
             Ok(message) => {
                 imported += 1;
                 messages.push(message);
@@ -2465,7 +2534,11 @@ fn process_extension_imports(app: tauri::AppHandle) -> Result<ExtensionImportSum
         }
     }
 
-    let pending = pending_extension_import_files()?.len();
+    if imported > 0 {
+        save_data_file(&data)?;
+    }
+
+    let pending = files.len().saturating_sub(imported + failed);
     if imported > 0 {
         let _ = app.emit("paper-manager:data-updated", ());
     }
