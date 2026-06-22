@@ -1,7 +1,7 @@
 {
   "name": "legra",
   "private": true,
-  "version": "0.1.1",
+  "version": "0.1.3",
   "description": "Local-first paper, PDF, note, and BibTeX manager",
   "license": "MIT",
   "type": "module",
