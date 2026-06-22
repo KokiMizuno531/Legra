@@ -257,6 +257,8 @@ function isReadyToRegister(form: PaperForm) {
 }
 
 function metadataToForm(current: PaperForm, metadata: PaperMetadata): PaperForm {
+  const resolvedFromArxiv = Boolean(metadata.arxiv_id) && !metadata.doi;
+
   return {
     ...current,
     title: metadata.title ?? current.title,
@@ -269,7 +271,7 @@ function metadataToForm(current: PaperForm, metadata: PaperMetadata): PaperForm 
     numpages: metadata.numpages?.toString() ?? current.numpages,
     month: metadata.month ?? current.month,
     publisher: metadata.publisher ?? current.publisher,
-    doi: metadata.doi ?? current.doi,
+    doi: resolvedFromArxiv ? "" : metadata.doi ?? current.doi,
     arxiv_id: metadata.arxiv_id ?? current.arxiv_id,
     url: metadata.url ?? current.url,
     abstract_text: metadata.abstract_text ?? current.abstract_text,

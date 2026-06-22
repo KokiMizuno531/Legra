@@ -34,13 +34,14 @@
   - `<published>` -> `year`, `month`
   - `<id>` -> `url`
   - `<summary>` -> `abstract_text`
-  - `<arxiv:doi>` -> `doi`
+  - `<arxiv:doi>` は取り込まず、`doi` は空のままにする
   - `<arxiv:journal_ref>` -> `publication`
 
 ## Test Plan
 
 - DOI のみ入力して `Register paper` を押すと、Crossref から取得してフォームが埋まる。
 - arXiv ID のみ入力して `Register paper` を押すと、arXiv から取得してフォームが埋まる。
+- arXiv API から取得したメタデータに `<arxiv:doi>` が含まれていても、DOI 欄は空になり `arxiv_id` だけが識別子として保存される。
 - 自動入力後、再度 `Register paper` を押すと保存される。
 - `Fetch metadata` ボタンで明示的に再取得できる。
 - API が 404、オフライン、パース失敗の場合、入力済みフォームを壊さずエラーを表示する。

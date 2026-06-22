@@ -1243,6 +1243,49 @@ fn child_text<'a>(node: roxmltree::Node<'a, 'a>, child_name: &str) -> Option<Str
         .filter(|value| !value.is_empty())
 }
 
+fn parse_arxiv_metadata(xml: &str, arxiv_id: &str) -> Result<PaperMetadata, String> {
+    let document = roxmltree::Document::parse(xml)
+        .map_err(|error| format!("Could not parse arXiv metadata: {error}"))?;
+    let entry = document
+        .descendants()
+        .find(|node| node.is_element() && node.tag_name().name() == "entry")
+        .ok_or_else(|| "arXiv metadata was not found.".to_string())?;
+
+    let authors = entry
+        .children()
+        .filter(|node| node.is_element() && node.tag_name().name() == "author")
+        .filter_map(|author| child_text(author, "name"))
+        .collect::<Vec<_>>();
+    let published = child_text(entry, "published");
+    let year = published
+        .as_deref()
+        .and_then(|value| value.get(0..4))
+        .and_then(|value| value.parse::<u16>().ok());
+    let month = published
+        .as_deref()
+        .and_then(|value| value.get(5..7))
+        .and_then(|value| value.parse::<u64>().ok())
+        .and_then(month_name);
+    let journal_ref = child_text(entry, "journal_ref");
+
+    Ok(PaperMetadata {
+        title: child_text(entry, "title"),
+        authors,
+        year,
+        publication: journal_ref,
+        volume: None,
+        issue: None,
+        pages: None,
+        numpages: None,
+        month,
+        publisher: None,
+        doi: None,
+        arxiv_id: Some(arxiv_id.to_string()),
+        url: child_text(entry, "id").or_else(|| Some(format!("https://arxiv.org/abs/{arxiv_id}"))),
+        abstract_text: child_text(entry, "summary"),
+    })
+}
+
 fn fetch_arxiv_metadata(arxiv_id: &str) -> Result<PaperMetadata, String> {
     let arxiv_id = normalize_arxiv_id(arxiv_id);
     if arxiv_id.is_empty() {
@@ -1269,47 +1312,7 @@ fn fetch_arxiv_metadata(arxiv_id: &str) -> Result<PaperMetadata, String> {
     let xml = response
         .text()
         .map_err(|error| format!("Could not read arXiv metadata: {error}"))?;
-    let document = roxmltree::Document::parse(&xml)
-        .map_err(|error| format!("Could not parse arXiv metadata: {error}"))?;
-    let entry = document
-        .descendants()
-        .find(|node| node.is_element() && node.tag_name().name() == "entry")
-        .ok_or_else(|| "arXiv metadata was not found.".to_string())?;
-
-    let authors = entry
-        .children()
-        .filter(|node| node.is_element() && node.tag_name().name() == "author")
-        .filter_map(|author| child_text(author, "name"))
-        .collect::<Vec<_>>();
-    let published = child_text(entry, "published");
-    let year = published
-        .as_deref()
-        .and_then(|value| value.get(0..4))
-        .and_then(|value| value.parse::<u16>().ok());
-    let month = published
-        .as_deref()
-        .and_then(|value| value.get(5..7))
-        .and_then(|value| value.parse::<u64>().ok())
-        .and_then(month_name);
-    let doi = child_text(entry, "doi");
-    let journal_ref = child_text(entry, "journal_ref");
-
-    Ok(PaperMetadata {
-        title: child_text(entry, "title"),
-        authors,
-        year,
-        publication: journal_ref,
-        volume: None,
-        issue: None,
-        pages: None,
-        numpages: None,
-        month,
-        publisher: None,
-        doi,
-        arxiv_id: Some(arxiv_id.clone()),
-        url: child_text(entry, "id").or_else(|| Some(format!("https://arxiv.org/abs/{arxiv_id}"))),
-        abstract_text: child_text(entry, "summary"),
-    })
+    parse_arxiv_metadata(&xml, &arxiv_id)
 }
 
 fn validate_pdf_path(data: &AppData, pdf_path: &Option<String>) -> Result<(), String> {
@@ -2344,11 +2347,28 @@ fn import_pdf_path(request: &ExtensionImportRequest) -> Option<String> {
         .map(|path| path.to_string_lossy().into_owned())
 }
 
+fn import_doi(metadata: Option<&PaperMetadata>, request_doi: Option<&str>) -> Option<String> {
+    let resolved_from_arxiv = metadata.is_some_and(|metadata| {
+        metadata
+            .arxiv_id
+            .as_deref()
+            .is_some_and(|arxiv_id| !arxiv_id.trim().is_empty())
+    });
+    if resolved_from_arxiv {
+        return None;
+    }
+
+    metadata
+        .and_then(|metadata| metadata.doi.clone())
+        .or_else(|| request_doi.map(normalize_doi))
+}
+
 fn import_request_to_register_input(
     request: ExtensionImportRequest,
 ) -> Result<RegisterPaperInput, String> {
     let metadata = metadata_for_import_request(&request)?;
     let valid_pdf_path = import_pdf_path(&request);
+    let doi = import_doi(metadata.as_ref(), request.doi.as_deref());
     let title = metadata
         .as_ref()
         .and_then(|metadata| metadata.title.clone())
@@ -2417,10 +2437,7 @@ fn import_request_to_register_input(
         publisher: metadata
             .as_ref()
             .and_then(|metadata| metadata.publisher.clone()),
-        doi: metadata
-            .as_ref()
-            .and_then(|metadata| metadata.doi.clone())
-            .or_else(|| request.doi.map(|doi| normalize_doi(&doi))),
+        doi,
         arxiv_id: metadata
             .as_ref()
             .and_then(|metadata| metadata.arxiv_id.clone())
@@ -3488,6 +3505,135 @@ fn check_note_files() -> Result<Vec<NoteStatus>, String> {
             exists: Path::new(&note.file_path).exists(),
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_paper(doi: Option<&str>, arxiv_id: Option<&str>) -> Paper {
+        Paper {
+            id: "paper-test".to_string(),
+            title: "A test paper".to_string(),
+            authors: vec!["Ada Lovelace".to_string()],
+            year: Some(2026),
+            publication: Some("Test Journal".to_string()),
+            volume: None,
+            issue: None,
+            pages: None,
+            numpages: None,
+            month: None,
+            publisher: None,
+            doi: doi.map(str::to_string),
+            arxiv_id: arxiv_id.map(str::to_string),
+            url: Some("https://arxiv.org/abs/2601.00001".to_string()),
+            abstract_text: None,
+            tags: Vec::new(),
+            status: None,
+            rating: None,
+            bibtex_key: None,
+            pdf_path: None,
+            original_pdf_path: None,
+            folder_category: None,
+            created_at: "0".to_string(),
+            updated_at: "0".to_string(),
+        }
+    }
+
+    fn test_settings() -> Settings {
+        Settings {
+            id: "settings-test".to_string(),
+            managed_directory: None,
+            filename_rule: default_filename_rule(),
+            note_directory: None,
+            marktext_path: None,
+            pdf_viewer_path: None,
+            chrome_import_directory: None,
+            chrome_extension_id: None,
+            bibtex_key_rule: default_bibtex_key_rule(),
+            bibtex_export_rule: default_bibtex_export_rule(),
+            journal_output_style: default_journal_output_style(),
+            journal_aliases: default_journal_aliases(),
+            cloud_sync_expected: default_cloud_sync_expected(),
+            workspace_root: None,
+            workspace_revision: None,
+            workspace_last_loaded_revision: None,
+            created_at: "0".to_string(),
+            updated_at: "0".to_string(),
+        }
+    }
+
+    #[test]
+    fn arxiv_metadata_ignores_doi_from_feed() {
+        let xml = r#"
+            <feed xmlns="http://www.w3.org/2005/Atom"
+                  xmlns:arxiv="http://arxiv.org/schemas/atom">
+              <entry>
+                <id>https://arxiv.org/abs/2601.00001</id>
+                <title>A test paper</title>
+                <published>2026-01-02T00:00:00Z</published>
+                <author><name>Ada Lovelace</name></author>
+                <summary>A test abstract.</summary>
+                <arxiv:doi>10.1000/published-paper</arxiv:doi>
+                <arxiv:journal_ref>Test Journal</arxiv:journal_ref>
+              </entry>
+            </feed>
+        "#;
+
+        let metadata = parse_arxiv_metadata(xml, "2601.00001").unwrap();
+
+        assert_eq!(metadata.doi, None);
+        assert_eq!(metadata.arxiv_id.as_deref(), Some("2601.00001"));
+        assert_eq!(metadata.publication.as_deref(), Some("Test Journal"));
+        assert_eq!(metadata.authors, vec!["Ada Lovelace"]);
+    }
+
+    #[test]
+    fn arxiv_import_does_not_restore_request_doi() {
+        let metadata = PaperMetadata {
+            title: None,
+            authors: Vec::new(),
+            year: None,
+            publication: None,
+            volume: None,
+            issue: None,
+            pages: None,
+            numpages: None,
+            month: None,
+            publisher: None,
+            doi: None,
+            arxiv_id: Some("2601.00001".to_string()),
+            url: None,
+            abstract_text: None,
+        };
+
+        assert_eq!(
+            import_doi(
+                Some(&metadata),
+                Some("https://doi.org/10.1000/published-paper")
+            ),
+            None
+        );
+        assert_eq!(
+            import_doi(None, Some("https://doi.org/10.1000/published-paper")).as_deref(),
+            Some("10.1000/published-paper")
+        );
+    }
+
+    #[test]
+    fn bibtex_entry_type_keeps_existing_identifier_precedence() {
+        let settings = test_settings();
+        let arxiv_only = paper_to_bibtex(&test_paper(None, Some("2601.00001")), &settings);
+        let doi_and_arxiv = paper_to_bibtex(
+            &test_paper(Some("10.1000/published-paper"), Some("2601.00001")),
+            &settings,
+        );
+
+        assert!(arxiv_only.starts_with("@misc{"));
+        assert!(arxiv_only.contains("eprint = {2601.00001}"));
+        assert!(doi_and_arxiv.starts_with("@article{"));
+        assert!(doi_and_arxiv.contains("doi = {10.1000/published-paper}"));
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
