@@ -7,11 +7,21 @@ on:
 
 jobs:
   check:
-    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libssl-dev patchelf
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -28,13 +38,9 @@ jobs:
       - name: Build frontend
         run: npm run build
 
-      - name: Check Tauri backend
+      - name: Test Tauri backend and Chrome native host
         working-directory: src-tauri
-        run: cargo check
-
-      - name: Check Chrome native host
-        working-directory: src-tauri
-        run: cargo check --bin paper_manager_native_host
+        run: cargo test
 
       - name: Check Chrome extension JavaScript
         run: |

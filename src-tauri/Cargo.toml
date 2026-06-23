@@ -1,6 +1,6 @@
 [package]
 name = "legra"
-version = "0.1.4"
+version = "0.2.0"
 description = "Desktop paper manager for local PDFs, notes, and BibTeX export"
 authors = ["Koki Mizuno"]
 edition = "2021"
