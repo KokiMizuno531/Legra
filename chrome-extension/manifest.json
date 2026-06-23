@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Legra importer",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Import DOI, arXiv, and accessible PDF files into Legra.",
   "icons": {
     "16": "icons/icon-16.png",
