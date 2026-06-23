@@ -34,6 +34,7 @@ struct ExtensionImportRequest {
     authors: Option<Vec<String>>,
     year: Option<u16>,
     publication: Option<String>,
+    abstract_text: Option<String>,
     pdf_path: Option<String>,
     suggested_category: Option<String>,
     tags: Option<Vec<String>>,

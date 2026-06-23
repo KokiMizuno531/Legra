@@ -176,6 +176,7 @@ struct ExtensionImportRequest {
     authors: Option<Vec<String>>,
     year: Option<u16>,
     publication: Option<String>,
+    abstract_text: Option<String>,
     pdf_path: Option<String>,
     suggested_category: Option<String>,
     tags: Option<Vec<String>>,
@@ -1243,6 +1244,149 @@ fn child_text<'a>(node: roxmltree::Node<'a, 'a>, child_name: &str) -> Option<Str
         .filter(|value| !value.is_empty())
 }
 
+fn parse_html_attributes(tag: &str) -> HashMap<String, String> {
+    let bytes = tag.as_bytes();
+    let mut attributes = HashMap::new();
+    let mut index = bytes.iter().position(|byte| *byte == b'<').unwrap_or(0) + 1;
+
+    while index < bytes.len() && !bytes[index].is_ascii_whitespace() && bytes[index] != b'>' {
+        index += 1;
+    }
+
+    while index < bytes.len() {
+        while index < bytes.len() && (bytes[index].is_ascii_whitespace() || bytes[index] == b'/') {
+            index += 1;
+        }
+        if index >= bytes.len() || bytes[index] == b'>' {
+            break;
+        }
+
+        let name_start = index;
+        while index < bytes.len()
+            && !bytes[index].is_ascii_whitespace()
+            && !matches!(bytes[index], b'=' | b'>' | b'/')
+        {
+            index += 1;
+        }
+        if name_start == index {
+            index += 1;
+            continue;
+        }
+        let name = tag[name_start..index].to_ascii_lowercase();
+
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        if index >= bytes.len() || bytes[index] != b'=' {
+            attributes.insert(name, String::new());
+            continue;
+        }
+        index += 1;
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+
+        let value = if index < bytes.len() && matches!(bytes[index], b'\'' | b'"') {
+            let quote = bytes[index];
+            index += 1;
+            let value_start = index;
+            while index < bytes.len() && bytes[index] != quote {
+                index += 1;
+            }
+            let value = tag[value_start..index].to_string();
+            if index < bytes.len() {
+                index += 1;
+            }
+            value
+        } else {
+            let value_start = index;
+            while index < bytes.len() && !bytes[index].is_ascii_whitespace() && bytes[index] != b'>'
+            {
+                index += 1;
+            }
+            tag[value_start..index].to_string()
+        };
+        attributes.insert(name, value);
+    }
+
+    attributes
+}
+
+fn html_tag_end(html: &str, start: usize) -> Option<usize> {
+    let bytes = html.as_bytes();
+    let mut quote = None;
+
+    for (offset, byte) in bytes[start..].iter().enumerate() {
+        if let Some(active_quote) = quote {
+            if *byte == active_quote {
+                quote = None;
+            }
+        } else if matches!(*byte, b'\'' | b'"') {
+            quote = Some(*byte);
+        } else if *byte == b'>' {
+            return Some(start + offset);
+        }
+    }
+
+    None
+}
+
+fn html_meta_values(html: &str, meta_name: &str) -> Vec<String> {
+    let lowercase_html = html.to_ascii_lowercase();
+    let expected_name = meta_name.to_ascii_lowercase();
+    let mut values = Vec::new();
+    let mut search_start = 0;
+
+    while let Some(relative_start) = lowercase_html[search_start..].find("<meta") {
+        let tag_start = search_start + relative_start;
+        let boundary = lowercase_html.as_bytes().get(tag_start + 5).copied();
+        if boundary.is_some_and(|byte| !byte.is_ascii_whitespace() && byte != b'>' && byte != b'/')
+        {
+            search_start = tag_start + 5;
+            continue;
+        }
+        let Some(tag_end) = html_tag_end(html, tag_start + 5) else {
+            break;
+        };
+        let attributes = parse_html_attributes(&html[tag_start..=tag_end]);
+        let name = attributes
+            .get("name")
+            .or_else(|| attributes.get("property"))
+            .map(|value| value.to_ascii_lowercase());
+        if name.as_deref() == Some(expected_name.as_str()) {
+            if let Some(content) = attributes.get("content") {
+                let value = clean_text(content);
+                if !value.is_empty() {
+                    values.push(value);
+                }
+            }
+        }
+        search_start = tag_end + 1;
+    }
+
+    values
+}
+
+fn first_html_meta_value(html: &str, names: &[&str]) -> Option<String> {
+    names
+        .iter()
+        .find_map(|name| html_meta_values(html, name).into_iter().next())
+}
+
+fn arxiv_date_parts(value: Option<&str>) -> (Option<u16>, Option<String>) {
+    let parts = value
+        .unwrap_or_default()
+        .split(|character: char| !character.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    let year = parts.first().and_then(|part| part.parse::<u16>().ok());
+    let month = parts
+        .get(1)
+        .and_then(|part| part.parse::<u64>().ok())
+        .and_then(month_name);
+    (year, month)
+}
+
 fn parse_arxiv_metadata(xml: &str, arxiv_id: &str) -> Result<PaperMetadata, String> {
     let document = roxmltree::Document::parse(xml)
         .map_err(|error| format!("Could not parse arXiv metadata: {error}"))?;
@@ -1256,6 +1400,10 @@ fn parse_arxiv_metadata(xml: &str, arxiv_id: &str) -> Result<PaperMetadata, Stri
         .filter(|node| node.is_element() && node.tag_name().name() == "author")
         .filter_map(|author| child_text(author, "name"))
         .collect::<Vec<_>>();
+    let title = child_text(entry, "title");
+    if title.is_none() || authors.is_empty() {
+        return Err("arXiv API response did not contain title and author metadata.".to_string());
+    }
     let published = child_text(entry, "published");
     let year = published
         .as_deref()
@@ -1269,7 +1417,7 @@ fn parse_arxiv_metadata(xml: &str, arxiv_id: &str) -> Result<PaperMetadata, Stri
     let journal_ref = child_text(entry, "journal_ref");
 
     Ok(PaperMetadata {
-        title: child_text(entry, "title"),
+        title,
         authors,
         year,
         publication: journal_ref,
@@ -1286,33 +1434,109 @@ fn parse_arxiv_metadata(xml: &str, arxiv_id: &str) -> Result<PaperMetadata, Stri
     })
 }
 
-fn fetch_arxiv_metadata(arxiv_id: &str) -> Result<PaperMetadata, String> {
-    let arxiv_id = normalize_arxiv_id(arxiv_id);
-    if arxiv_id.is_empty() {
-        return Err("arXiv ID is required.".to_string());
+fn parse_arxiv_abstract_page(html: &str, arxiv_id: &str) -> Result<PaperMetadata, String> {
+    let title = first_html_meta_value(html, &["citation_title"]);
+    let authors = html_meta_values(html, "citation_author");
+    if title.is_none() || authors.is_empty() {
+        return Err("arXiv abstract page did not contain title and author metadata.".to_string());
     }
 
+    let date = first_html_meta_value(
+        html,
+        &[
+            "citation_publication_date",
+            "citation_date",
+            "citation_online_date",
+        ],
+    );
+    let (year, month) = arxiv_date_parts(date.as_deref());
+    let first_page = first_html_meta_value(html, &["citation_firstpage"]);
+    let last_page = first_html_meta_value(html, &["citation_lastpage"]);
+    let pages = match (first_page, last_page) {
+        (Some(first), Some(last)) if first != last => Some(format!("{first}-{last}")),
+        (Some(first), _) => Some(first),
+        (None, Some(last)) => Some(last),
+        (None, None) => None,
+    };
+
+    Ok(PaperMetadata {
+        title,
+        authors,
+        year,
+        publication: first_html_meta_value(html, &["citation_journal_title"]),
+        volume: first_html_meta_value(html, &["citation_volume"]),
+        issue: first_html_meta_value(html, &["citation_issue"]),
+        pages,
+        numpages: None,
+        month,
+        publisher: first_html_meta_value(html, &["citation_publisher"]),
+        doi: None,
+        arxiv_id: Some(arxiv_id.to_string()),
+        url: Some(format!("https://arxiv.org/abs/{arxiv_id}")),
+        abstract_text: first_html_meta_value(
+            html,
+            &["citation_abstract", "og:description", "description"],
+        ),
+    })
+}
+
+fn fetch_arxiv_abstract_page_metadata(arxiv_id: &str) -> Result<PaperMetadata, String> {
+    let path_id = urlencoding::encode(arxiv_id).replace("%2F", "/");
+    let url = format!("https://arxiv.org/abs/{path_id}");
+    let response = metadata_http_client()?
+        .get(url)
+        .send()
+        .map_err(|error| format!("Could not fetch arXiv abstract page: {error}"))?;
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "Could not fetch arXiv abstract page. HTTP status: {}.",
+            response.status()
+        ));
+    }
+
+    let html = response
+        .text()
+        .map_err(|error| format!("Could not read arXiv abstract page: {error}"))?;
+    parse_arxiv_abstract_page(&html, arxiv_id)
+}
+
+fn fetch_arxiv_api_metadata(arxiv_id: &str) -> Result<PaperMetadata, String> {
     let client = metadata_http_client()?;
     let url = format!(
         "https://export.arxiv.org/api/query?id_list={}&max_results=1",
-        urlencoding::encode(&arxiv_id)
+        urlencoding::encode(arxiv_id)
     );
     let response = client
         .get(url)
         .send()
-        .map_err(|error| format!("Could not fetch arXiv metadata: {error}"))?;
+        .map_err(|error| format!("Could not fetch arXiv API metadata: {error}"))?;
 
     if !response.status().is_success() {
         return Err(format!(
-            "Could not fetch arXiv metadata. HTTP status: {}.",
+            "Could not fetch arXiv API metadata. HTTP status: {}.",
             response.status()
         ));
     }
 
     let xml = response
         .text()
-        .map_err(|error| format!("Could not read arXiv metadata: {error}"))?;
-    parse_arxiv_metadata(&xml, &arxiv_id)
+        .map_err(|error| format!("Could not read arXiv API metadata: {error}"))?;
+    parse_arxiv_metadata(&xml, arxiv_id)
+}
+
+fn fetch_arxiv_metadata(arxiv_id: &str) -> Result<PaperMetadata, String> {
+    let arxiv_id = normalize_arxiv_id(arxiv_id);
+    if arxiv_id.is_empty() {
+        return Err("arXiv ID is required.".to_string());
+    }
+
+    match fetch_arxiv_api_metadata(&arxiv_id) {
+        Ok(metadata) => Ok(metadata),
+        Err(api_error) => fetch_arxiv_abstract_page_metadata(&arxiv_id).map_err(|page_error| {
+            format!("Could not fetch arXiv metadata. {api_error} {page_error}")
+        }),
+    }
 }
 
 fn validate_pdf_path(data: &AppData, pdf_path: &Option<String>) -> Result<(), String> {
@@ -2294,17 +2518,33 @@ fn metadata_for_import_request(
         return Ok(None);
     }
 
+    let arxiv_id = request
+        .arxiv_id
+        .as_deref()
+        .map(normalize_arxiv_id)
+        .filter(|arxiv_id| !arxiv_id.is_empty());
+    let source_is_arxiv = request.source_url.as_deref().is_some_and(|url| {
+        let lowercase = url.to_ascii_lowercase();
+        lowercase.contains("arxiv.org/abs/") || lowercase.contains("arxiv.org/pdf/")
+    });
+    let doi_is_arxiv = request.doi.as_deref().is_some_and(|doi| {
+        normalize_doi(doi)
+            .to_ascii_lowercase()
+            .starts_with("10.48550/arxiv.")
+    });
+
+    if let Some(arxiv_id) = arxiv_id.as_deref() {
+        if source_is_arxiv || doi_is_arxiv || request.doi.as_deref().is_none_or(str::is_empty) {
+            return metadata_for_arxiv_import_request(request, arxiv_id).map(Some);
+        }
+    }
+
     if let Some(doi) = request.doi.as_deref().map(normalize_doi) {
         if !doi.is_empty() {
             match fetch_crossref_metadata(&doi) {
                 Ok(metadata) => return Ok(Some(metadata)),
                 Err(error) => {
-                    if request
-                        .arxiv_id
-                        .as_ref()
-                        .map(|arxiv_id| !arxiv_id.trim().is_empty())
-                        .unwrap_or(false)
-                    {
+                    if arxiv_id.is_some() {
                         // arXiv pages often expose a 10.48550/arXiv.* DOI that may not be in Crossref yet.
                     } else {
                         return Err(error);
@@ -2314,13 +2554,102 @@ fn metadata_for_import_request(
         }
     }
 
-    if let Some(arxiv_id) = request.arxiv_id.as_deref().map(normalize_arxiv_id) {
-        if !arxiv_id.is_empty() {
-            return fetch_arxiv_metadata(&arxiv_id).map(Some);
-        }
+    if let Some(arxiv_id) = arxiv_id.as_deref() {
+        return metadata_for_arxiv_import_request(request, arxiv_id).map(Some);
     }
 
     Ok(None)
+}
+
+fn metadata_from_arxiv_import_request(
+    request: &ExtensionImportRequest,
+    arxiv_id: &str,
+) -> PaperMetadata {
+    PaperMetadata {
+        title: normalize_optional(request.title.clone()).map(|title| clean_text(&title)),
+        authors: request
+            .authors
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|author| clean_text(&author))
+            .filter(|author| !author.is_empty())
+            .collect(),
+        year: request.year,
+        publication: normalize_optional(request.publication.clone())
+            .map(|publication| clean_text(&publication)),
+        volume: None,
+        issue: None,
+        pages: None,
+        numpages: None,
+        month: None,
+        publisher: None,
+        doi: None,
+        arxiv_id: Some(arxiv_id.to_string()),
+        url: normalize_optional(request.source_url.clone())
+            .or_else(|| Some(format!("https://arxiv.org/abs/{arxiv_id}"))),
+        abstract_text: normalize_optional(request.abstract_text.clone())
+            .map(|abstract_text| clean_text(&abstract_text)),
+    }
+}
+
+fn metadata_has_title_and_authors(metadata: &PaperMetadata) -> bool {
+    metadata
+        .title
+        .as_deref()
+        .is_some_and(|title| !title.trim().is_empty())
+        && !metadata.authors.is_empty()
+}
+
+fn merge_paper_metadata(primary: PaperMetadata, fallback: PaperMetadata) -> PaperMetadata {
+    PaperMetadata {
+        title: primary.title.or(fallback.title),
+        authors: if primary.authors.is_empty() {
+            fallback.authors
+        } else {
+            primary.authors
+        },
+        year: primary.year.or(fallback.year),
+        publication: primary.publication.or(fallback.publication),
+        volume: primary.volume.or(fallback.volume),
+        issue: primary.issue.or(fallback.issue),
+        pages: primary.pages.or(fallback.pages),
+        numpages: primary.numpages.or(fallback.numpages),
+        month: primary.month.or(fallback.month),
+        publisher: primary.publisher.or(fallback.publisher),
+        doi: primary.doi.or(fallback.doi),
+        arxiv_id: primary.arxiv_id.or(fallback.arxiv_id),
+        url: primary.url.or(fallback.url),
+        abstract_text: primary.abstract_text.or(fallback.abstract_text),
+    }
+}
+
+fn metadata_for_arxiv_import_request(
+    request: &ExtensionImportRequest,
+    arxiv_id: &str,
+) -> Result<PaperMetadata, String> {
+    let browser_metadata = metadata_from_arxiv_import_request(request, arxiv_id);
+    if metadata_has_title_and_authors(&browser_metadata) {
+        return Ok(browser_metadata);
+    }
+
+    let page_metadata = match fetch_arxiv_abstract_page_metadata(arxiv_id) {
+        Ok(metadata) => metadata,
+        Err(page_error) => fetch_arxiv_api_metadata(arxiv_id).map_err(|api_error| {
+            let mut missing = Vec::new();
+            if browser_metadata.title.is_none() {
+                missing.push("title");
+            }
+            if browser_metadata.authors.is_empty() {
+                missing.push("authors");
+            }
+            format!(
+                "Could not complete arXiv import metadata (missing {}). {page_error} {api_error}",
+                missing.join(" and ")
+            )
+        })?,
+    };
+    Ok(merge_paper_metadata(browser_metadata, page_metadata))
 }
 
 fn valid_import_pdf_path(request: &ExtensionImportRequest) -> Option<String> {
@@ -2452,7 +2781,8 @@ fn import_request_to_register_input(
             .or(request.source_url),
         abstract_text: metadata
             .as_ref()
-            .and_then(|metadata| metadata.abstract_text.clone()),
+            .and_then(|metadata| metadata.abstract_text.clone())
+            .or(request.abstract_text),
         tags,
         status: Some("unread".to_string()),
         pdf_path: valid_pdf_path,
@@ -3586,6 +3916,68 @@ mod tests {
         assert_eq!(metadata.arxiv_id.as_deref(), Some("2601.00001"));
         assert_eq!(metadata.publication.as_deref(), Some("Test Journal"));
         assert_eq!(metadata.authors, vec!["Ada Lovelace"]);
+    }
+
+    #[test]
+    fn arxiv_abstract_page_metadata_uses_initial_date_and_decodes_content() {
+        let html = r#"
+            <html>
+              <head>
+                <meta content="A &amp; B: x &gt; y" name="citation_title">
+                <meta name='citation_author' content='Ada &amp; Lovelace'>
+                <meta name="citation_author" content="Grace Hopper">
+                <meta name="citation_date" content="2025/07/03">
+                <meta name="citation_online_date" content="2026/03/03">
+                <meta name="citation_journal_title" content="Journal &amp; Review">
+                <meta name="citation_abstract" content="An important &amp; useful result.">
+              </head>
+            </html>
+        "#;
+
+        let metadata = parse_arxiv_abstract_page(html, "2507.02793").unwrap();
+
+        assert_eq!(metadata.title.as_deref(), Some("A & B: x > y"));
+        assert_eq!(metadata.authors, vec!["Ada & Lovelace", "Grace Hopper"]);
+        assert_eq!(metadata.year, Some(2025));
+        assert_eq!(metadata.month.as_deref(), Some("Jul"));
+        assert_eq!(metadata.publication.as_deref(), Some("Journal & Review"));
+        assert_eq!(
+            metadata.abstract_text.as_deref(),
+            Some("An important & useful result.")
+        );
+        assert_eq!(metadata.doi, None);
+        assert_eq!(metadata.arxiv_id.as_deref(), Some("2507.02793"));
+    }
+
+    #[test]
+    fn complete_browser_arxiv_metadata_does_not_require_remote_fetch() {
+        let request = ExtensionImportRequest {
+            id: Some("chrome-import-test".to_string()),
+            source_url: Some("https://arxiv.org/abs/2507.02793".to_string()),
+            doi: Some("10.48550/arXiv.2507.02793".to_string()),
+            arxiv_id: Some("2507.02793".to_string()),
+            title: Some("A browser title".to_string()),
+            authors: Some(vec!["Ada Lovelace".to_string()]),
+            year: Some(2025),
+            publication: None,
+            abstract_text: Some("A browser abstract.".to_string()),
+            pdf_path: None,
+            suggested_category: None,
+            tags: Some(vec!["chrome-import".to_string()]),
+            import_warnings: None,
+        };
+
+        let metadata = metadata_for_import_request(&request).unwrap().unwrap();
+
+        assert_eq!(metadata.title.as_deref(), Some("A browser title"));
+        assert_eq!(metadata.authors, vec!["Ada Lovelace"]);
+        assert_eq!(metadata.year, Some(2025));
+        assert_eq!(
+            metadata.abstract_text.as_deref(),
+            Some("A browser abstract.")
+        );
+        assert_eq!(metadata.doi, None);
+        assert_eq!(metadata.arxiv_id.as_deref(), Some("2507.02793"));
     }
 
     #[test]

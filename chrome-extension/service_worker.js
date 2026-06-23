@@ -89,6 +89,7 @@ function pageDetector() {
     .filter(Boolean);
   const yearValue =
     meta("citation_publication_date") ||
+    meta("citation_date") ||
     meta("citation_online_date") ||
     meta("dc.date") ||
     meta("DC.Date") ||
@@ -115,6 +116,7 @@ function pageDetector() {
     authors,
     year: Number.isFinite(year) ? year : undefined,
     publication: meta("citation_journal_title") || meta("dc.source") || "",
+    abstract_text: meta("citation_abstract") || meta("description") || "",
     doi: normalizeDoiInPage(doi),
     arxiv_id: normalizeArxivInPage(arxiv_id),
     pdf_url,
@@ -257,6 +259,7 @@ async function importCurrentTab(message) {
     authors: paper.authors?.length ? paper.authors : undefined,
     year: paper.year,
     publication: paper.publication || undefined,
+    abstract_text: paper.abstract_text || undefined,
     pdf_path: pdfPath || undefined,
     suggested_category: message.category || undefined,
     tags: ["chrome-import"],
