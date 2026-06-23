@@ -1,6 +1,6 @@
 cask "legra" do
   version "0.1.4"
-  sha256 "REPLACE_WITH_RELEASE_SHA256"
+  sha256 "8aee33b5dc1e5818c40dd9081386530464f581410e77681793209fda805a09f5"
 
   url "https://github.com/KokiMizuno531/Legra/releases/download/v#{version}/Legra_#{version}_aarch64.app.zip"
   name "Legra"
@@ -18,7 +18,7 @@ cask "legra" do
   end
 
   zap trash: [
-    "~/Library/Application Support/Legra",
     "~/Library/Application Support/Google/Chrome/NativeMessagingHosts/app.legra.importer.json",
+    "~/Library/Application Support/Legra",
   ]
 end
