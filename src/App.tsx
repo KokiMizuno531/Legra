@@ -143,9 +143,15 @@ type WorkspaceHealth = {
 type ChromeNativeHostStatus = {
   installed: boolean;
   manifest_path: string;
+  manifest_paths: string[];
   host_path: string;
   extension_id: string;
   message: string;
+};
+
+type PlatformInfo = {
+  os: "macos" | "windows" | "linux" | "unknown";
+  path_separator: string;
 };
 
 type Filters = {
@@ -229,6 +235,13 @@ function parseList(value: string) {
 function optionalString(value: string) {
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function pathDisplayName(value: string | undefined) {
+  if (!value) {
+    return "Not set";
+  }
+  return value.split(/[\\/]/).filter(Boolean).pop() || value;
 }
 
 function metadataKey(form: PaperForm) {
@@ -390,6 +403,7 @@ function App() {
     : null;
   const isEditWindow = editWindowPaperId !== null;
   const [status, setStatus] = useState<AppStatus | null>(null);
+  const [platformInfo, setPlatformInfo] = useState<PlatformInfo | null>(null);
   const [data, setData] = useState<AppData | null>(null);
   const [form, setForm] = useState<PaperForm>(initialForm);
   const [editForm, setEditForm] = useState<PaperForm>(initialForm);
@@ -472,12 +486,14 @@ function App() {
 
   async function loadSavedData() {
     setError(null);
-    const [nextStatus, nextData] = await Promise.all([
+    const [nextStatus, nextData, nextPlatformInfo] = await Promise.all([
       invoke<AppStatus>("get_app_status"),
       invoke<AppData>("load_app_data"),
+      invoke<PlatformInfo>("get_platform_info"),
     ]);
     setStatus(nextStatus);
     setData(nextData);
+    setPlatformInfo(nextPlatformInfo);
     setSettingsForm(settingsToForm(nextData.settings));
     setBibtexJournalStyle(
       nextData.settings.journal_output_style || initialSettingsForm.journal_output_style,
@@ -570,34 +586,17 @@ function App() {
       return;
     }
 
-    const managedDirectory = data?.settings.managed_directory;
-    if (!managedDirectory) {
-      setError("Set managed directory before selecting a category.");
-      return;
-    }
-
-    const normalizedManaged = managedDirectory.replace(/\/+$/, "");
-    const normalizedSelected = selected.replace(/\/+$/, "");
-    if (normalizedSelected === normalizedManaged) {
+    try {
+      const category = await invoke<string>("resolve_folder_category", {
+        selectedDirectory: selected,
+      });
       if (target === "register") {
-        updateForm("folder_category", "");
+        updateForm("folder_category", category);
       } else {
-        updateEditForm("folder_category", "");
+        updateEditForm("folder_category", category);
       }
-      return;
-    }
-
-    const prefix = `${normalizedManaged}/`;
-    if (!normalizedSelected.startsWith(prefix)) {
-      setError("Select a category folder inside the managed directory.");
-      return;
-    }
-
-    const category = normalizedSelected.slice(prefix.length);
-    if (target === "register") {
-      updateForm("folder_category", category);
-    } else {
-      updateEditForm("folder_category", category);
+    } catch (reason) {
+      setError(String(reason));
     }
   }
 
@@ -638,7 +637,7 @@ function App() {
   async function chooseSettingsApp(field: keyof SettingsForm) {
     setError(null);
     const selected = await open({
-      directory: true,
+      directory: platformInfo?.os === "macos",
       multiple: false,
     });
 
@@ -1359,8 +1358,8 @@ function App() {
             <h2>Storage</h2>
             <p className="path-text">
               {data?.settings.workspace_root
-                ? `Workspace: ${data.settings.workspace_root.split('/').pop()}`
-                : `Managed: ${data?.settings.managed_directory ? data.settings.managed_directory.split('/').pop() : "Not set"}`}
+                ? `Workspace: ${pathDisplayName(data.settings.workspace_root)}`
+                : `Managed: ${pathDisplayName(data?.settings.managed_directory)}`}
             </p>
             <p>{message}</p>
           </div>
@@ -1389,7 +1388,9 @@ function App() {
                   onChange={(event) =>
                     updateSettingsForm("managed_directory", event.currentTarget.value)
                   }
-                  placeholder="/path/to/library"
+                  placeholder={
+                    platformInfo?.os === "windows" ? "C:\\path\\to\\library" : "/path/to/library"
+                  }
                 />
                 <button
                   type="button"
@@ -1458,7 +1459,12 @@ function App() {
                   <dt>Status</dt>
                   <dd>{chromeNativeHostStatus.installed ? "Installed" : "Not installed"}</dd>
                   <dt>Manifest</dt>
-                  <dd>{chromeNativeHostStatus.manifest_path}</dd>
+                  <dd>
+                    {(chromeNativeHostStatus.manifest_paths.length > 0
+                      ? chromeNativeHostStatus.manifest_paths
+                      : [chromeNativeHostStatus.manifest_path]
+                    ).join(", ")}
+                  </dd>
                   <dt>Host</dt>
                   <dd>{chromeNativeHostStatus.host_path}</dd>
                 </dl>
@@ -1527,14 +1533,22 @@ function App() {
             <h3>External apps</h3>
             <div className="field-row">
               <label>
-                MarkText path or app name
+                {platformInfo?.os === "macos"
+                  ? "MarkText path or app name"
+                  : "Markdown editor executable or command"}
                 <div className="file-row">
                   <input
                     value={settingsForm.marktext_path}
                     onChange={(event) =>
                       updateSettingsForm("marktext_path", event.currentTarget.value)
                     }
-                    placeholder="MarkText or /Applications/MarkText.app"
+                    placeholder={
+                      platformInfo?.os === "macos"
+                        ? "MarkText or /Applications/MarkText.app"
+                        : platformInfo?.os === "windows"
+                          ? "C:\\Program Files\\MarkText\\MarkText.exe"
+                          : "marktext or /usr/bin/marktext"
+                    }
                   />
                   <button type="button" onClick={() => chooseSettingsApp("marktext_path")}>
                     Select
@@ -1543,14 +1557,22 @@ function App() {
               </label>
 
               <label>
-                PDF viewer path or app name
+                {platformInfo?.os === "macos"
+                  ? "PDF viewer path or app name"
+                  : "PDF viewer executable or command"}
                 <div className="file-row">
                   <input
                     value={settingsForm.pdf_viewer_path}
                     onChange={(event) =>
                       updateSettingsForm("pdf_viewer_path", event.currentTarget.value)
                     }
-                    placeholder="Preview or /Applications/Preview.app"
+                    placeholder={
+                      platformInfo?.os === "macos"
+                        ? "Preview or /Applications/Preview.app"
+                        : platformInfo?.os === "windows"
+                          ? "C:\\path\\to\\viewer.exe"
+                          : "evince or /usr/bin/evince"
+                    }
                   />
                   <button type="button" onClick={() => chooseSettingsApp("pdf_viewer_path")}>
                     Select
@@ -1713,8 +1735,8 @@ function App() {
             <h2>Storage</h2>
             <p className="path-text">
               {data?.settings.workspace_root
-                ? `Workspace: ${data.settings.workspace_root.split('/').pop()}`
-                : `Managed: ${data?.settings.managed_directory ? data.settings.managed_directory.split('/').pop() : "Not set"}`}
+                ? `Workspace: ${pathDisplayName(data.settings.workspace_root)}`
+                : `Managed: ${pathDisplayName(data?.settings.managed_directory)}`}
             </p>
             <p>{message}</p>
           </div>
@@ -1942,8 +1964,8 @@ function App() {
             <h2>Storage</h2>
             <p className="path-text">
               {data?.settings.workspace_root
-                ? `Workspace: ${data.settings.workspace_root.split('/').pop()}`
-                : `Managed: ${data?.settings.managed_directory ? data.settings.managed_directory.split('/').pop() : "Not set"}`}
+                ? `Workspace: ${pathDisplayName(data.settings.workspace_root)}`
+                : `Managed: ${pathDisplayName(data?.settings.managed_directory)}`}
             </p>
             <p>{message}</p>
           </div>
@@ -2214,8 +2236,8 @@ function App() {
             <h2>Storage</h2>
             <p className="path-text">
               {data?.settings.workspace_root
-                ? `Workspace: ${data.settings.workspace_root.split('/').pop()}`
-                : `Managed: ${data?.settings.managed_directory ? data.settings.managed_directory.split('/').pop() : "Not set"}`}
+                ? `Workspace: ${pathDisplayName(data.settings.workspace_root)}`
+                : `Managed: ${pathDisplayName(data?.settings.managed_directory)}`}
             </p>
             <p>{message}</p>
           </div>

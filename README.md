@@ -31,7 +31,7 @@ The Chrome extension only works with pages and PDFs that the user can legitimate
 
 ## Current Limitations
 
-- macOS is the primary supported platform.
+- Windows and macOS builds are unsigned. Windows may show a SmartScreen warning.
 - PDF annotation is not built in.
 - Word, LibreOffice, and Google Docs citation plugins are not included.
 - Shared workspaces use regular file sync. They detect conflicting saves but do not merge simultaneous edits.
@@ -39,19 +39,20 @@ The Chrome extension only works with pages and PDFs that the user can legitimate
 
 ## Requirements
 
-- macOS 11 or later
-- Homebrew for the recommended install path
+- macOS 11 or later on Apple Silicon
+- Windows 10 or 11 x64 with Microsoft Edge WebView2
+- Linux x64 with WebKitGTK 4.1; Ubuntu 22.04 or Debian 12 are the supported baselines
 
 Development also requires:
 
 - Node.js and npm
 - Rust toolchain
-- Tauri prerequisites for macOS
+- Tauri prerequisites for the development operating system
 - Chrome or a Chromium-based browser for the optional extension
 
 ## Install
 
-Install Legra with Homebrew:
+On macOS, install Legra with Homebrew:
 
 ```sh
 brew tap KokiMizuno531/legra
@@ -62,6 +63,18 @@ Open Legra:
 
 ```sh
 open -a Legra
+```
+
+On Windows, download `Legra_<version>_windows_x86_64-setup.exe` from GitHub Releases and run the installer. The installer is currently unsigned.
+
+On Linux, download either the AppImage or Debian package from GitHub Releases:
+
+```sh
+chmod +x Legra_<version>_linux_x86_64.AppImage
+./Legra_<version>_linux_x86_64.AppImage
+
+# Debian/Ubuntu alternative
+sudo apt install ./Legra_<version>_linux_amd64.deb
 ```
 
 The Chrome extension is not distributed through Homebrew yet. To use Chrome import, load `chrome-extension/` as an unpacked Chrome extension, copy its extension ID, paste it into `Settings -> Chrome extension ID`, and click `Install Native Host`.
@@ -141,7 +154,7 @@ Shared workspaces are intentionally lightweight. If another machine changes the 
 
 ## Releases and Homebrew
 
-Tagged releases such as `v0.1.0` run the GitHub Actions release workflow. The workflow builds the macOS app bundle, uploads the generated `.app.zip` file as a release asset, and writes `SHA256SUMS.txt`.
+Tagged releases run the GitHub Actions release workflow. A release is published only after the macOS ARM64 app, Windows x64 NSIS installer, Linux x64 AppImage, and Linux amd64 Debian package all build successfully. `SHA256SUMS.txt` covers every release asset.
 
 The public Homebrew tap is:
 
@@ -152,7 +165,7 @@ brew install --cask legra
 
 A copy of the cask is also kept in [Packaging/homebrew](Packaging/homebrew) for reference.
 
-After installing from Homebrew, open Legra, set the Chrome extension ID in Settings, and click `Install Native Host` to enable Chrome import.
+After installing on any supported operating system, open Legra, set the Chrome extension ID in Settings, and click `Install Native Host` to enable Chrome or Chromium import.
 
 ## Repository Safety
 
@@ -173,8 +186,7 @@ Before opening a pull request, run:
 ```sh
 npm run build
 cd src-tauri
-cargo check
-cargo check --bin paper_manager_native_host
+cargo test
 ```
 
 For Chrome extension changes:

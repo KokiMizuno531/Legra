@@ -9,8 +9,11 @@ use std::{
 };
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem, Submenu},
+    path::BaseDirectory,
     Emitter, Manager,
 };
+
+mod platform;
 
 const SETTINGS_MENU_ID: &str = "settings";
 const CHROME_NATIVE_HOST_NAME: &str = "app.legra.importer";
@@ -231,9 +234,16 @@ struct WorkspaceHealth {
 struct ChromeNativeHostStatus {
     installed: bool,
     manifest_path: String,
+    manifest_paths: Vec<String>,
     host_path: String,
     extension_id: String,
     message: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PlatformInfo {
+    os: String,
+    path_separator: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -331,18 +341,7 @@ fn app_root_dir() -> Result<PathBuf, String> {
 }
 
 fn default_setting_dir() -> Result<PathBuf, String> {
-    if let Ok(path) = std::env::var("LEGRA_SETTING_DIR") {
-        let trimmed = path.trim();
-        if !trimmed.is_empty() {
-            return Ok(PathBuf::from(trimmed));
-        }
-    }
-
-    let home = std::env::var("HOME").map_err(|_| "Could not resolve HOME directory.".to_string())?;
-    Ok(PathBuf::from(home)
-        .join("Library")
-        .join("Application Support")
-        .join("Legra"))
+    platform::default_setting_dir()
 }
 
 fn legacy_setting_dir() -> Result<PathBuf, String> {
@@ -452,41 +451,148 @@ fn extension_import_failed_dir() -> Result<PathBuf, String> {
     Ok(extension_import_root_dir()?.join("failed"))
 }
 
-fn chrome_native_host_manifest_path() -> Result<PathBuf, String> {
-    let home = std::env::var("HOME").map_err(|_| "Could not resolve HOME directory.".to_string())?;
-    Ok(PathBuf::from(home)
-        .join("Library")
-        .join("Application Support")
-        .join("Google")
-        .join("Chrome")
-        .join("NativeMessagingHosts")
-        .join(format!("{CHROME_NATIVE_HOST_NAME}.json")))
+fn chrome_native_host_manifest_paths() -> Result<Vec<PathBuf>, String> {
+    let file_name = format!("{CHROME_NATIVE_HOST_NAME}.json");
+
+    #[cfg(target_os = "macos")]
+    {
+        let base = platform::user_config_dir()?;
+        return Ok(vec![
+            base.join("Google")
+                .join("Chrome")
+                .join("NativeMessagingHosts")
+                .join(&file_name),
+            base.join("Chromium")
+                .join("NativeMessagingHosts")
+                .join(&file_name),
+        ]);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let base = platform::user_config_dir()?;
+        return Ok(vec![
+            base.join("google-chrome")
+                .join("NativeMessagingHosts")
+                .join(&file_name),
+            base.join("chromium")
+                .join("NativeMessagingHosts")
+                .join(&file_name),
+        ]);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        return Ok(vec![setting_dir()?.join("native-host").join(file_name)]);
+    }
+
+    #[allow(unreachable_code)]
+    Ok(vec![setting_dir()?.join("native-host").join(file_name)])
 }
 
-fn chrome_native_host_binary_path() -> Result<PathBuf, String> {
+fn installed_native_host_binary_path() -> Result<PathBuf, String> {
+    Ok(setting_dir()?
+        .join("native-host")
+        .join(platform::NATIVE_HOST_BINARY_NAME))
+}
+
+fn bundled_native_host_binary_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let resource_path = app
+        .path()
+        .resolve(platform::NATIVE_HOST_BINARY_NAME, BaseDirectory::Resource)
+        .map_err(|error| error.to_string())?;
+    if resource_path.exists() {
+        return Ok(resource_path);
+    }
+
+    let legacy_resource_path = app
+        .path()
+        .resolve(
+            format!("release-resources/{}", platform::NATIVE_HOST_BINARY_NAME),
+            BaseDirectory::Resource,
+        )
+        .map_err(|error| error.to_string())?;
+    if legacy_resource_path.exists() {
+        return Ok(legacy_resource_path);
+    }
+
     let app_dir = app_root_dir()?;
-    let same_dir = app_dir.join("paper_manager_native_host");
-    if same_dir.exists() {
-        return Ok(same_dir);
+    for candidate in [
+        app_dir.join(platform::NATIVE_HOST_BINARY_NAME),
+        app_dir
+            .join("..")
+            .join("debug")
+            .join(platform::NATIVE_HOST_BINARY_NAME),
+        app_dir
+            .join("..")
+            .join("release")
+            .join(platform::NATIVE_HOST_BINARY_NAME),
+    ] {
+        if candidate.exists() {
+            return fs::canonicalize(candidate).map_err(|error| error.to_string());
+        }
     }
 
-    let bundled_resource = app_dir
-        .join("..")
-        .join("Resources")
-        .join("paper_manager_native_host");
-    if bundled_resource.exists() {
-        return fs::canonicalize(&bundled_resource).map_err(|error| error.to_string());
-    }
+    Err("Chrome Native Host binary is not bundled. Build or install Legra first.".to_string())
+}
 
-    let development_path = app_dir
-        .join("..")
-        .join("debug")
-        .join("paper_manager_native_host");
-    if development_path.exists() {
-        return fs::canonicalize(&development_path).map_err(|error| error.to_string());
-    }
+#[cfg(target_os = "windows")]
+fn windows_native_host_registry_keys() -> [&'static str; 2] {
+    [
+        "HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts\\app.legra.importer",
+        "HKCU\\Software\\Chromium\\NativeMessagingHosts\\app.legra.importer",
+    ]
+}
 
-    Ok(same_dir)
+#[cfg(target_os = "windows")]
+fn register_windows_native_host(manifest_path: &Path) -> Result<(), String> {
+    let manifest = manifest_path.to_string_lossy().into_owned();
+    for key in windows_native_host_registry_keys() {
+        let status = Command::new("reg")
+            .args(["add", key, "/ve", "/t", "REG_SZ", "/d", &manifest, "/f"])
+            .status()
+            .map_err(|error| format!("Could not register Chrome Native Host: {error}"))?;
+        if !status.success() {
+            return Err(format!("Could not register Chrome Native Host at {key}."));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn register_windows_native_host(_manifest_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn unregister_windows_native_host() -> Result<(), String> {
+    for key in windows_native_host_registry_keys() {
+        Command::new("reg")
+            .args(["delete", key, "/f"])
+            .status()
+            .map_err(|error| format!("Could not unregister Chrome Native Host: {error}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn unregister_windows_native_host() -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn windows_native_host_is_registered() -> bool {
+    windows_native_host_registry_keys().into_iter().all(|key| {
+        Command::new("reg")
+            .args(["query", key, "/ve"])
+            .status()
+            .is_ok_and(|status| status.success())
+    })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn windows_native_host_is_registered() -> bool {
+    true
 }
 
 fn normalize_chrome_extension_id(value: Option<String>) -> Result<String, String> {
@@ -720,14 +826,50 @@ fn empty_app_data() -> Result<AppData, String> {
     })
 }
 
-fn load_or_default_app_data() -> Result<AppData, String> {
+fn load_local_app_data() -> Result<AppData, String> {
     let data_file = data_file_path()?;
     if !data_file.exists() {
         return empty_app_data();
     }
 
     let json = fs::read_to_string(&data_file).map_err(|error| error.to_string())?;
-    let local_data: AppData = serde_json::from_str(&json).map_err(|error| error.to_string())?;
+    serde_json::from_str(&json).map_err(|error| error.to_string())
+}
+
+fn merge_local_settings_into_workspace(
+    workspace_data: &mut AppData,
+    local_settings: &Settings,
+    root: &Path,
+) {
+    workspace_data.settings.managed_directory =
+        Some(workspace_papers_dir(root).to_string_lossy().into_owned());
+    workspace_data.settings.note_directory =
+        Some(workspace_notes_dir(root).to_string_lossy().into_owned());
+    workspace_data.settings.marktext_path = local_settings.marktext_path.clone();
+    workspace_data.settings.pdf_viewer_path = local_settings.pdf_viewer_path.clone();
+    workspace_data.settings.chrome_import_directory =
+        local_settings.chrome_import_directory.clone();
+    workspace_data.settings.chrome_extension_id = local_settings.chrome_extension_id.clone();
+    workspace_data.settings.workspace_root = Some(root.to_string_lossy().into_owned());
+    let revision = workspace_data.settings.workspace_revision.unwrap_or(0);
+    workspace_data.settings.workspace_last_loaded_revision = Some(revision);
+}
+
+fn workspace_data_for_storage(data: &AppData) -> AppData {
+    let mut workspace_data = data.clone();
+    workspace_data.settings.managed_directory = None;
+    workspace_data.settings.note_directory = None;
+    workspace_data.settings.marktext_path = None;
+    workspace_data.settings.pdf_viewer_path = None;
+    workspace_data.settings.chrome_import_directory = None;
+    workspace_data.settings.chrome_extension_id = None;
+    workspace_data.settings.workspace_root = None;
+    workspace_data.settings.workspace_last_loaded_revision = None;
+    workspace_data
+}
+
+fn load_or_default_app_data() -> Result<AppData, String> {
+    let local_data = load_local_app_data()?;
     let Some(root) = active_workspace_root(&local_data) else {
         return Ok(local_data);
     };
@@ -740,9 +882,7 @@ fn load_or_default_app_data() -> Result<AppData, String> {
     let workspace_json = fs::read_to_string(&workspace_file).map_err(|error| error.to_string())?;
     let mut workspace_data: AppData =
         serde_json::from_str(&workspace_json).map_err(|error| error.to_string())?;
-    let revision = workspace_data.settings.workspace_revision.unwrap_or(0);
-    workspace_data.settings.workspace_root = Some(root.to_string_lossy().into_owned());
-    workspace_data.settings.workspace_last_loaded_revision = Some(revision);
+    merge_local_settings_into_workspace(&mut workspace_data, &local_data.settings, &root);
     Ok(workspace_data)
 }
 
@@ -788,8 +928,9 @@ fn save_data_file(data: &AppData) -> Result<AppStatus, String> {
             );
         }
         fs::write(&lock, current_timestamp()?).map_err(|error| error.to_string())?;
+        let workspace_data = workspace_data_for_storage(&next_data);
         let workspace_json =
-            serde_json::to_string_pretty(&next_data).map_err(|error| error.to_string())?;
+            serde_json::to_string_pretty(&workspace_data).map_err(|error| error.to_string())?;
         let write_result =
             fs::write(&workspace_file, workspace_json).map_err(|error| error.to_string());
         let _ = fs::remove_file(&lock);
@@ -2889,6 +3030,14 @@ fn get_app_status() -> Result<AppStatus, String> {
 }
 
 #[tauri::command]
+fn get_platform_info() -> PlatformInfo {
+    PlatformInfo {
+        os: platform::PLATFORM_NAME.to_string(),
+        path_separator: platform::PATH_SEPARATOR.to_string(),
+    }
+}
+
+#[tauri::command]
 fn save_app_data(data: AppData) -> Result<AppStatus, String> {
     save_data_file(&data)
 }
@@ -3184,6 +3333,38 @@ fn update_managed_directory(
     Ok(data)
 }
 
+#[tauri::command]
+fn resolve_folder_category(selected_directory: String) -> Result<String, String> {
+    let data = load_or_default_app_data()?;
+    let root = if let Some(workspace_root) = active_workspace_root(&data) {
+        workspace_papers_dir(&workspace_root)
+    } else {
+        data.settings
+            .managed_directory
+            .as_deref()
+            .map(PathBuf::from)
+            .ok_or_else(|| "Set managed directory before selecting a category.".to_string())?
+    };
+    let selected = PathBuf::from(selected_directory.trim());
+    if !selected.exists() || !selected.is_dir() {
+        return Err("Selected category directory does not exist.".to_string());
+    }
+    if !root.exists() || !root.is_dir() {
+        return Err("Managed directory does not exist.".to_string());
+    }
+
+    let canonical_root = fs::canonicalize(root).map_err(|error| error.to_string())?;
+    let canonical_selected = fs::canonicalize(selected).map_err(|error| error.to_string())?;
+    let relative = canonical_selected
+        .strip_prefix(&canonical_root)
+        .map_err(|_| "Select a category folder inside the managed directory.".to_string())?;
+    Ok(relative
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/"))
+}
+
 fn validate_optional_directory(
     value: &Option<String>,
     label: &str,
@@ -3210,10 +3391,15 @@ fn validate_optional_app_path(
     };
     let path = PathBuf::from(&value);
     if path.exists() {
+        #[cfg(target_os = "macos")]
         if path.is_file() || path.is_dir() {
             return Ok(Some(path.to_string_lossy().into_owned()));
         }
-        return Err(format!("{label} is not a file or application directory."));
+        #[cfg(not(target_os = "macos"))]
+        if path.is_file() {
+            return Ok(Some(path.to_string_lossy().into_owned()));
+        }
+        return Err(format!("{label} is not an executable file."));
     }
 
     Ok(Some(value))
@@ -3277,18 +3463,25 @@ fn update_settings(app: tauri::AppHandle, input: UpdateSettingsInput) -> Result<
 }
 
 fn chrome_native_host_status_for(extension_id: String) -> Result<ChromeNativeHostStatus, String> {
-    let manifest_path = chrome_native_host_manifest_path()?;
-    let host_path = chrome_native_host_binary_path()?;
-    let installed = manifest_path.exists();
+    let manifest_paths = chrome_native_host_manifest_paths()?;
+    let host_path = installed_native_host_binary_path()?;
+    let installed = host_path.exists()
+        && manifest_paths.iter().all(|path| path.exists())
+        && windows_native_host_is_registered();
     let message = if installed {
-        "Chrome Native Host manifest is installed.".to_string()
+        "Chrome Native Host is installed for Google Chrome and Chromium.".to_string()
     } else {
-        "Chrome Native Host manifest is not installed.".to_string()
+        "Chrome Native Host is not installed or needs repair.".to_string()
     };
+    let manifest_path = manifest_paths.first().cloned().unwrap_or_default();
 
     Ok(ChromeNativeHostStatus {
         installed,
         manifest_path: manifest_path.to_string_lossy().into_owned(),
+        manifest_paths: manifest_paths
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect(),
         host_path: host_path.to_string_lossy().into_owned(),
         extension_id,
         message,
@@ -3305,22 +3498,41 @@ fn check_chrome_native_host(
 
 #[tauri::command]
 fn install_chrome_native_host(
+    app: tauri::AppHandle,
     input: ChromeNativeHostInput,
 ) -> Result<ChromeNativeHostStatus, String> {
     let extension_id = normalize_chrome_extension_id(input.extension_id)?;
-    let manifest_path = chrome_native_host_manifest_path()?;
-    let host_path = chrome_native_host_binary_path()?;
-    if !host_path.exists() {
-        return Err(format!(
-            "Chrome Native Host binary was not found at {}. Build or install Legra first.",
-            host_path.to_string_lossy()
-        ));
-    }
+    install_chrome_native_host_for(&app, &extension_id)
+}
 
-    if let Some(parent) = manifest_path.parent() {
+fn install_chrome_native_host_for(
+    app: &tauri::AppHandle,
+    extension_id: &str,
+) -> Result<ChromeNativeHostStatus, String> {
+    let source_host_path = bundled_native_host_binary_path(app)?;
+    let host_path = installed_native_host_binary_path()?;
+    if let Some(parent) = host_path.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
+    fs::copy(&source_host_path, &host_path).map_err(|error| {
+        format!(
+            "Could not install Chrome Native Host binary from {}: {error}",
+            source_host_path.to_string_lossy()
+        )
+    })?;
 
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&host_path)
+            .map_err(|error| error.to_string())?
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&host_path, permissions).map_err(|error| error.to_string())?;
+    }
+
+    let host_path = fs::canonicalize(&host_path).map_err(|error| error.to_string())?;
+    let manifest_paths = chrome_native_host_manifest_paths()?;
     let manifest = serde_json::json!({
         "name": CHROME_NATIVE_HOST_NAME,
         "description": "Legra Chrome import native host",
@@ -3329,28 +3541,57 @@ fn install_chrome_native_host(
         "allowed_origins": [format!("chrome-extension://{extension_id}/")]
     });
     let json = serde_json::to_string_pretty(&manifest).map_err(|error| error.to_string())?;
-    fs::write(&manifest_path, json).map_err(|error| error.to_string())?;
 
-    Ok(ChromeNativeHostStatus {
-        installed: true,
-        manifest_path: manifest_path.to_string_lossy().into_owned(),
-        host_path: host_path.to_string_lossy().into_owned(),
-        extension_id,
-        message: "Chrome Native Host manifest installed.".to_string(),
-    })
+    for manifest_path in &manifest_paths {
+        if let Some(parent) = manifest_path.parent() {
+            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        fs::write(manifest_path, &json).map_err(|error| error.to_string())?;
+    }
+    if let Some(primary_manifest) = manifest_paths.first() {
+        register_windows_native_host(primary_manifest)?;
+    }
+
+    let mut status = chrome_native_host_status_for(extension_id.to_string())?;
+    status.message = "Chrome Native Host installed for Google Chrome and Chromium.".to_string();
+    Ok(status)
 }
 
 #[tauri::command]
 fn uninstall_chrome_native_host() -> Result<ChromeNativeHostStatus, String> {
     let extension_id = normalize_chrome_extension_id(None)?;
-    let manifest_path = chrome_native_host_manifest_path()?;
-    if manifest_path.exists() {
-        fs::remove_file(&manifest_path).map_err(|error| error.to_string())?;
+    for manifest_path in chrome_native_host_manifest_paths()? {
+        if manifest_path.exists() {
+            fs::remove_file(&manifest_path).map_err(|error| error.to_string())?;
+        }
+    }
+    unregister_windows_native_host()?;
+    let host_path = installed_native_host_binary_path()?;
+    if host_path.exists() {
+        fs::remove_file(host_path).map_err(|error| error.to_string())?;
     }
 
     let mut status = chrome_native_host_status_for(extension_id)?;
-    status.message = "Chrome Native Host manifest removed.".to_string();
+    status.message = "Chrome Native Host removed.".to_string();
     Ok(status)
+}
+
+fn repair_existing_chrome_native_host(app: &tauri::AppHandle) {
+    let has_existing_registration = chrome_native_host_manifest_paths()
+        .map(|paths| paths.iter().any(|path| path.exists()))
+        .unwrap_or(false)
+        || cfg!(target_os = "windows") && windows_native_host_is_registered();
+    if !has_existing_registration {
+        return;
+    }
+
+    let extension_id = load_or_default_app_data()
+        .ok()
+        .and_then(|data| data.settings.chrome_extension_id)
+        .and_then(|value| normalize_chrome_extension_id(Some(value)).ok());
+    if let Some(extension_id) = extension_id {
+        let _ = install_chrome_native_host_for(app, &extension_id);
+    }
 }
 
 #[tauri::command]
@@ -3562,14 +3803,10 @@ fn open_shared_workspace(app: tauri::AppHandle, input: WorkspaceInput) -> Result
         return Err("Workspace does not contain paper-manager-workspace.json.".to_string());
     }
 
+    let local_data = load_local_app_data()?;
     let json = fs::read_to_string(&workspace_file).map_err(|error| error.to_string())?;
     let mut data: AppData = serde_json::from_str(&json).map_err(|error| error.to_string())?;
-    let revision = data.settings.workspace_revision.unwrap_or(0);
-    data.settings.workspace_root = Some(root.to_string_lossy().into_owned());
-    data.settings.workspace_last_loaded_revision = Some(revision);
-    data.settings.managed_directory =
-        Some(workspace_papers_dir(&root).to_string_lossy().into_owned());
-    data.settings.note_directory = Some(workspace_notes_dir(&root).to_string_lossy().into_owned());
+    merge_local_settings_into_workspace(&mut data, &local_data.settings, &root);
 
     let local_json = serde_json::to_string_pretty(&data).map_err(|error| error.to_string())?;
     fs::create_dir_all(setting_dir()?).map_err(|error| error.to_string())?;
@@ -3750,20 +3987,41 @@ fn open_path_with_application(
     configured_app: Option<&str>,
     fallback_app: &str,
 ) -> Result<(), String> {
-    let app = configured_app
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(fallback_app);
-    let status = Command::new("open")
-        .args(["-a", app])
-        .arg(target_path)
-        .status()
-        .map_err(|error| error.to_string())?;
+    #[cfg(target_os = "macos")]
+    {
+        let app = configured_app
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(fallback_app);
+        let status = Command::new("open")
+            .args(["-a", app])
+            .arg(target_path)
+            .status()
+            .map_err(|error| error.to_string())?;
 
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("Could not open file with {app}."))
+        return if status.success() {
+            Ok(())
+        } else {
+            Err(format!("Could not open file with {app}."))
+        };
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        if let Some(app) = configured_app
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Command::new(app)
+                .arg(target_path)
+                .spawn()
+                .map_err(|error| format!("Could not open file with {app}: {error}"))?;
+            return Ok(());
+        }
+
+        let _ = fallback_app;
+        tauri_plugin_opener::open_path(target_path.to_string_lossy().as_ref(), None::<&str>)
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -3981,6 +4239,74 @@ mod tests {
     }
 
     #[test]
+    fn workspace_storage_excludes_machine_local_settings() {
+        let mut data = AppData {
+            papers: Vec::new(),
+            notes: Vec::new(),
+            settings: test_settings(),
+        };
+        data.settings.managed_directory = Some("/local/papers".to_string());
+        data.settings.note_directory = Some("/local/notes".to_string());
+        data.settings.marktext_path = Some("/local/MarkText".to_string());
+        data.settings.pdf_viewer_path = Some("/local/Preview".to_string());
+        data.settings.chrome_import_directory = Some("/local/imports".to_string());
+        data.settings.chrome_extension_id = Some("abcdefghijklmnopabcdefghijklmnop".to_string());
+        data.settings.workspace_root = Some("/local/workspace".to_string());
+        data.settings.workspace_last_loaded_revision = Some(4);
+        data.settings.workspace_revision = Some(5);
+
+        let stored = workspace_data_for_storage(&data);
+
+        assert_eq!(stored.settings.managed_directory, None);
+        assert_eq!(stored.settings.note_directory, None);
+        assert_eq!(stored.settings.marktext_path, None);
+        assert_eq!(stored.settings.pdf_viewer_path, None);
+        assert_eq!(stored.settings.chrome_import_directory, None);
+        assert_eq!(stored.settings.chrome_extension_id, None);
+        assert_eq!(stored.settings.workspace_root, None);
+        assert_eq!(stored.settings.workspace_last_loaded_revision, None);
+        assert_eq!(stored.settings.workspace_revision, Some(5));
+    }
+
+    #[test]
+    fn workspace_load_keeps_local_apps_and_rebases_storage_paths() {
+        let mut local_settings = test_settings();
+        local_settings.marktext_path = Some("local-markdown-editor".to_string());
+        local_settings.pdf_viewer_path = Some("local-pdf-viewer".to_string());
+        local_settings.chrome_import_directory = Some("local-imports".to_string());
+        local_settings.chrome_extension_id = Some("abcdefghijklmnopabcdefghijklmnop".to_string());
+
+        let mut workspace_data = AppData {
+            papers: Vec::new(),
+            notes: Vec::new(),
+            settings: test_settings(),
+        };
+        workspace_data.settings.workspace_revision = Some(7);
+        workspace_data.settings.marktext_path = Some("other-machine-editor".to_string());
+        let root = PathBuf::from("workspace-root");
+
+        merge_local_settings_into_workspace(&mut workspace_data, &local_settings, &root);
+
+        assert_eq!(
+            workspace_data.settings.managed_directory,
+            Some(workspace_papers_dir(&root).to_string_lossy().into_owned())
+        );
+        assert_eq!(
+            workspace_data.settings.note_directory,
+            Some(workspace_notes_dir(&root).to_string_lossy().into_owned())
+        );
+        assert_eq!(
+            workspace_data.settings.marktext_path.as_deref(),
+            Some("local-markdown-editor")
+        );
+        assert_eq!(workspace_data.settings.workspace_revision, Some(7));
+        assert_eq!(
+            workspace_data.settings.workspace_last_loaded_revision,
+            Some(7)
+        );
+    }
+
+    #[test]
     fn arxiv_import_does_not_restore_request_doi() {
         let metadata = PaperMetadata {
             title: None,
@@ -4033,6 +4359,10 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .setup(|app| {
+            repair_existing_chrome_native_host(app.handle());
+            Ok(())
+        })
         .menu(|app| {
             let app_menu = Submenu::with_items(
                 app,
@@ -4088,6 +4418,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_app_status,
+            get_platform_info,
             save_app_data,
             load_app_data,
             fetch_paper_metadata,
@@ -4099,6 +4430,7 @@ pub fn run() {
             register_paper,
             update_paper,
             update_managed_directory,
+            resolve_folder_category,
             update_settings,
             check_chrome_native_host,
             install_chrome_native_host,

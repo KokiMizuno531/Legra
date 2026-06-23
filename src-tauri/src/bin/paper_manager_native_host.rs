@@ -7,6 +7,10 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+#[allow(dead_code)]
+#[path = "../platform.rs"]
+mod platform;
+
 #[derive(Debug, Deserialize)]
 struct Paper {
     folder_category: Option<String>,
@@ -64,18 +68,7 @@ fn app_root_dir() -> Result<PathBuf, String> {
 }
 
 fn default_setting_dir() -> Result<PathBuf, String> {
-    if let Ok(path) = std::env::var("LEGRA_SETTING_DIR") {
-        let trimmed = path.trim();
-        if !trimmed.is_empty() {
-            return Ok(PathBuf::from(trimmed));
-        }
-    }
-
-    let home = std::env::var("HOME").map_err(|_| "Could not resolve HOME directory.".to_string())?;
-    Ok(PathBuf::from(home)
-        .join("Library")
-        .join("Application Support")
-        .join("Legra"))
+    platform::default_setting_dir()
 }
 
 fn legacy_setting_dir() -> Result<PathBuf, String> {
@@ -95,9 +88,7 @@ fn setting_dir() -> Result<PathBuf, String> {
 }
 
 fn pending_dir() -> Result<PathBuf, String> {
-    Ok(setting_dir()?
-        .join("extension-imports")
-        .join("pending"))
+    Ok(setting_dir()?.join("extension-imports").join("pending"))
 }
 
 fn data_file_path() -> Result<PathBuf, String> {
@@ -174,9 +165,15 @@ fn read_app_data() -> Result<Option<AppData>, String> {
     }
 
     let workspace_json = fs::read_to_string(&workspace_file).map_err(|error| error.to_string())?;
-    serde_json::from_str(&workspace_json)
-        .map(Some)
-        .map_err(|error| error.to_string())
+    let mut workspace_data: AppData =
+        serde_json::from_str(&workspace_json).map_err(|error| error.to_string())?;
+    workspace_data.settings.workspace_root = Some(workspace_root.to_string());
+    workspace_data.settings.managed_directory = Some(
+        workspace_papers_dir(Path::new(workspace_root))
+            .to_string_lossy()
+            .into_owned(),
+    );
+    Ok(Some(workspace_data))
 }
 
 fn add_category_with_ancestors(categories: &mut BTreeSet<String>, value: &str) {
