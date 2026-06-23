@@ -398,14 +398,14 @@ fn active_workspace_root(data: &AppData) -> Option<PathBuf> {
 }
 
 fn path_for_runtime(data: &AppData, stored_path: &str) -> PathBuf {
-    let path = PathBuf::from(stored_path);
-    if path.is_absolute() {
+    let path = PathBuf::from(stored_path.trim());
+    if path.as_os_str().is_empty() {
         return path;
     }
 
-    active_workspace_root(data)
-        .map(|root| root.join(&path))
-        .unwrap_or(path)
+    let join_roots = runtime_join_roots(data);
+    let search_roots = runtime_search_roots(data);
+    path_for_runtime_with_roots(&path, &join_roots, &search_roots)
 }
 
 fn path_for_storage(data: &AppData, path: &Path) -> String {
@@ -416,6 +416,109 @@ fn path_for_storage(data: &AppData, path: &Path) -> String {
     }
 
     path.to_string_lossy().into_owned()
+}
+
+fn push_unique_path(roots: &mut Vec<PathBuf>, candidate: PathBuf) {
+    if candidate.as_os_str().is_empty() {
+        return;
+    }
+
+    if roots.iter().any(|existing| existing == &candidate) {
+        return;
+    }
+
+    roots.push(candidate);
+}
+
+fn runtime_join_roots(data: &AppData) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+
+    if let Some(root) = active_workspace_root(data) {
+        push_unique_path(&mut roots, root);
+    }
+    if let Some(path) = data.settings.managed_directory.as_deref() {
+        push_unique_path(&mut roots, PathBuf::from(path));
+    }
+    if let Some(path) = data.settings.note_directory.as_deref() {
+        push_unique_path(&mut roots, PathBuf::from(path));
+    }
+    if let Some(path) = data.settings.chrome_import_directory.as_deref() {
+        push_unique_path(&mut roots, PathBuf::from(path));
+    }
+    if let Ok(dir) = setting_dir() {
+        push_unique_path(&mut roots, dir);
+    }
+    if let Ok(dir) = legacy_setting_dir() {
+        push_unique_path(&mut roots, dir);
+    }
+
+    roots
+}
+
+fn runtime_search_roots(data: &AppData) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+
+    if let Some(root) = active_workspace_root(data) {
+        push_unique_path(&mut roots, workspace_papers_dir(&root));
+        push_unique_path(&mut roots, workspace_notes_dir(&root));
+    }
+    if let Some(path) = data.settings.managed_directory.as_deref() {
+        push_unique_path(&mut roots, PathBuf::from(path));
+    }
+    if let Some(path) = data.settings.note_directory.as_deref() {
+        push_unique_path(&mut roots, PathBuf::from(path));
+    }
+    if let Some(path) = data.settings.chrome_import_directory.as_deref() {
+        push_unique_path(&mut roots, PathBuf::from(path));
+    }
+    if let Ok(dir) = setting_dir() {
+        push_unique_path(&mut roots, dir);
+    }
+    if let Ok(dir) = legacy_setting_dir() {
+        push_unique_path(&mut roots, dir);
+    }
+
+    roots
+}
+
+fn path_for_runtime_with_roots(
+    stored_path: &Path,
+    join_roots: &[PathBuf],
+    search_roots: &[PathBuf],
+) -> PathBuf {
+    if stored_path.exists() {
+        return stored_path.to_path_buf();
+    }
+
+    let mut candidates = Vec::new();
+    if stored_path.is_absolute() {
+        candidates.push(stored_path.to_path_buf());
+    } else {
+        for root in join_roots {
+            candidates.push(root.join(stored_path));
+        }
+        candidates.push(stored_path.to_path_buf());
+    }
+
+    for candidate in candidates {
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+
+    let Some(file_name) = stored_path.file_name().and_then(|value| value.to_str()) else {
+        return stored_path.to_path_buf();
+    };
+
+    let mut files = HashMap::new();
+    for root in search_roots {
+        let _ = collect_files_by_basename(root, &mut files);
+    }
+
+    files
+        .get(file_name)
+        .cloned()
+        .unwrap_or_else(|| stored_path.to_path_buf())
 }
 
 fn notes_dir() -> Result<PathBuf, String> {
@@ -1680,13 +1783,16 @@ fn fetch_arxiv_metadata(arxiv_id: &str) -> Result<PaperMetadata, String> {
     }
 }
 
-fn validate_pdf_path(data: &AppData, pdf_path: &Option<String>) -> Result<(), String> {
-    let Some(path) = pdf_path else {
-        return Ok(());
+fn resolve_pdf_path(data: &AppData, pdf_path: &Option<String>) -> Result<Option<PathBuf>, String> {
+    let Some(path) = pdf_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    else {
+        return Ok(None);
     };
-    let path = path_for_runtime(data, path);
-    let path = path.as_path();
 
+    let path = path_for_runtime(data, path);
     if !path.exists() {
         return Err("PDF file does not exist.".to_string());
     }
@@ -1695,17 +1801,19 @@ fn validate_pdf_path(data: &AppData, pdf_path: &Option<String>) -> Result<(), St
         return Err("Selected PDF path is not a file.".to_string());
     }
 
-    let is_pdf = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .map(|extension| extension.eq_ignore_ascii_case("pdf"))
-        .unwrap_or(false);
-
-    if !is_pdf {
+    if !is_pdf_path(&path) {
         return Err("Selected file is not a PDF.".to_string());
     }
 
-    Ok(())
+    Ok(Some(path))
+}
+
+fn normalize_pdf_storage_path(
+    data: &AppData,
+    pdf_path: &Option<String>,
+) -> Result<Option<String>, String> {
+    Ok(resolve_pdf_path(data, pdf_path)?
+        .map(|path| path_for_storage(data, &path)))
 }
 
 fn sanitize_filename(value: &str) -> String {
@@ -1987,19 +2095,7 @@ fn organize_pdf_for_paper(
     folder_category: Option<String>,
 ) -> Result<(), String> {
     let workspace_root = active_workspace_root(data);
-    let current_pdf_path = data.papers[paper_index]
-        .pdf_path
-        .as_deref()
-        .ok_or_else(|| "This paper does not have a PDF path.".to_string())?;
-    let current_pdf_path = path_for_runtime(data, current_pdf_path);
-
-    if !current_pdf_path.exists() {
-        return Err("PDF file does not exist.".to_string());
-    }
-
-    if !current_pdf_path.is_file() {
-        return Err("PDF path is not a file.".to_string());
-    }
+    let current_pdf_path = paper_pdf_runtime_path(data, &data.papers[paper_index])?;
 
     let target = target_pdf_path(data, &data.papers[paper_index], folder_category.as_deref())?;
     let target_dir = target_pdf_dir(data, folder_category.as_deref())?;
@@ -2387,6 +2483,44 @@ fn is_markdown_path(file_path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn is_pdf_path(file_path: &Path) -> bool {
+    file_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.eq_ignore_ascii_case("pdf"))
+        .unwrap_or(false)
+}
+
+fn paper_pdf_source_path(paper: &Paper) -> Option<&str> {
+    paper.pdf_path.as_deref().or(paper.original_pdf_path.as_deref())
+}
+
+fn paper_pdf_runtime_path(data: &AppData, paper: &Paper) -> Result<PathBuf, String> {
+    let mut has_source = false;
+    if let Some(stored_path) = paper_pdf_source_path(paper) {
+        has_source = true;
+        let path = path_for_runtime(data, stored_path);
+        if path.exists() && path.is_file() && is_pdf_path(&path) {
+            return Ok(path);
+        }
+
+        if paper.pdf_path.as_deref() == Some(stored_path) {
+            if let Some(original_pdf_path) = paper.original_pdf_path.as_deref() {
+                let path = path_for_runtime(data, original_pdf_path);
+                if path.exists() && path.is_file() && is_pdf_path(&path) {
+                    return Ok(path);
+                }
+            }
+        }
+    }
+
+    if !has_source {
+        return Err("This paper does not have a PDF path.".to_string());
+    }
+
+    Err("PDF file does not exist.".to_string())
+}
+
 fn ensure_not_duplicate(
     data: &AppData,
     id: Option<&str>,
@@ -2445,11 +2579,10 @@ fn register_paper_input(input: RegisterPaperInput) -> Result<AppData, String> {
     }
 
     let mut data = load_or_default_app_data()?;
-    validate_pdf_path(&data, &input.pdf_path)?;
-    ensure_not_duplicate(&data, None, &input.title, &input.doi, &input.pdf_path)?;
+    let pdf_path = normalize_pdf_storage_path(&data, &input.pdf_path)?;
+    ensure_not_duplicate(&data, None, &input.title, &input.doi, &pdf_path)?;
 
     let timestamp = current_timestamp()?;
-    let pdf_path = normalize_optional(input.pdf_path);
     let paper = Paper {
         id: now_id()?,
         title,
@@ -2507,7 +2640,7 @@ fn register_or_update_import_input_into_data(
     data: &mut AppData,
     input: RegisterPaperInput,
 ) -> Result<String, String> {
-    validate_pdf_path(&data, &input.pdf_path)?;
+    let valid_pdf_path = normalize_pdf_storage_path(data, &input.pdf_path)?;
     let input_doi = input.doi.as_deref().map(normalize_key);
     let input_title = normalize_key(&input.title);
     let existing_index = data.papers.iter().position(|paper| {
@@ -2518,9 +2651,8 @@ fn register_or_update_import_input_into_data(
     });
 
     let Some(paper_index) = existing_index else {
-        ensure_not_duplicate(data, None, &input.title, &input.doi, &input.pdf_path)?;
+        ensure_not_duplicate(data, None, &input.title, &input.doi, &valid_pdf_path)?;
         let timestamp = current_timestamp()?;
-        let pdf_path = normalize_optional(input.pdf_path);
         let paper = Paper {
             id: now_id()?,
             title: input.title.trim().to_string(),
@@ -2551,8 +2683,8 @@ fn register_or_update_import_input_into_data(
             status: normalize_optional(input.status),
             rating: None,
             bibtex_key: None,
-            pdf_path: pdf_path.clone(),
-            original_pdf_path: pdf_path,
+            pdf_path: valid_pdf_path.clone(),
+            original_pdf_path: valid_pdf_path,
             folder_category: normalize_optional(input.folder_category),
             created_at: timestamp.clone(),
             updated_at: timestamp,
@@ -2622,10 +2754,9 @@ fn register_or_update_import_input_into_data(
             paper.folder_category = normalize_optional(input.folder_category.clone());
         }
         if paper.pdf_path.is_none() {
-            let pdf_path = normalize_optional(input.pdf_path.clone());
-            added_pdf = pdf_path.is_some();
-            paper.pdf_path = pdf_path.clone();
-            paper.original_pdf_path = pdf_path;
+            added_pdf = valid_pdf_path.is_some();
+            paper.pdf_path = valid_pdf_path.clone();
+            paper.original_pdf_path = valid_pdf_path.clone();
         }
         merge_tags(&mut paper.tags, input.tags.clone());
         paper.updated_at = timestamp;
@@ -3263,13 +3394,13 @@ fn update_paper(app: tauri::AppHandle, input: UpdatePaperInput) -> Result<AppDat
     }
 
     let mut data = load_or_default_app_data()?;
-    validate_pdf_path(&data, &input.pdf_path)?;
+    let pdf_path = normalize_pdf_storage_path(&data, &input.pdf_path)?;
     ensure_not_duplicate(
         &data,
         Some(&input.id),
         &input.title,
         &input.doi,
-        &input.pdf_path,
+        &pdf_path,
     )?;
 
     let timestamp = current_timestamp()?;
@@ -3300,7 +3431,7 @@ fn update_paper(app: tauri::AppHandle, input: UpdatePaperInput) -> Result<AppDat
         .filter(|tag| !tag.is_empty())
         .collect();
     paper.status = normalize_optional(input.status);
-    paper.pdf_path = normalize_optional(input.pdf_path);
+    paper.pdf_path = pdf_path;
     paper.folder_category = normalize_optional(input.folder_category);
     paper.updated_at = timestamp;
 
@@ -3880,10 +4011,8 @@ fn check_workspace_health() -> Result<WorkspaceHealth, String> {
     }
 
     for paper in &data.papers {
-        if let Some(pdf_path) = paper.pdf_path.as_deref() {
-            if !path_for_runtime(&data, pdf_path).exists() {
-                warnings.push(format!("Missing PDF: {}", paper.title));
-            }
+        if paper_pdf_runtime_path(&data, paper).is_err() {
+            warnings.push(format!("Missing PDF: {}", paper.title));
         }
     }
     for note in &data.notes {
@@ -4053,30 +4182,43 @@ fn open_note(note_id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn open_paper_pdf(paper_id: String) -> Result<(), String> {
-    let data = load_or_default_app_data()?;
-    let paper = data
+fn open_paper_pdf(app: tauri::AppHandle, paper_id: String) -> Result<(), String> {
+    let mut data = load_or_default_app_data()?;
+    let paper_index = data
         .papers
         .iter()
-        .find(|paper| paper.id == paper_id)
+        .position(|paper| paper.id == paper_id)
         .ok_or_else(|| "Paper was not found.".to_string())?;
-    let pdf_path = paper
-        .pdf_path
-        .as_deref()
-        .ok_or_else(|| "This paper does not have a PDF path.".to_string())?;
-    let pdf_path_buf = path_for_runtime(&data, pdf_path);
-    let pdf_path = pdf_path_buf.as_path();
+    let pdf_path = paper_pdf_runtime_path(&data, &data.papers[paper_index])?;
 
-    if !pdf_path.exists() {
-        return Err("PDF file does not exist.".to_string());
-    }
+    let repaired_storage_path = path_for_storage(&data, &pdf_path);
+    let needs_repair = data.papers[paper_index].pdf_path.as_deref()
+        != Some(repaired_storage_path.as_str());
+    if needs_repair {
+        let mut repaired_data = data.clone();
+        let paper_title = repaired_data.papers[paper_index].title.clone();
+        {
+            let paper = repaired_data
+                .papers
+                .get_mut(paper_index)
+                .ok_or_else(|| "Paper was not found.".to_string())?;
+            paper.pdf_path = Some(repaired_storage_path);
+            paper.updated_at = current_timestamp()?;
+        }
 
-    if !pdf_path.is_file() {
-        return Err("PDF path is not a file.".to_string());
+        match save_data_file(&repaired_data) {
+            Ok(_) => {
+                let _ = app.emit("paper-manager:data-updated", ());
+                data = repaired_data;
+            }
+            Err(error) => {
+                eprintln!("Could not repair PDF path for {paper_title}: {error}");
+            }
+        }
     }
 
     open_path_with_application(
-        pdf_path,
+        pdf_path.as_path(),
         data.settings.pdf_viewer_path.as_deref(),
         "Preview",
     )
@@ -4098,6 +4240,26 @@ fn check_note_files() -> Result<Vec<NoteStatus>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn temp_test_dir(prefix: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be monotonic for tests")
+            .as_nanos();
+        std::env::temp_dir().join(format!("legra-{prefix}-{stamp}-{}", std::process::id()))
+    }
+
+    fn write_test_pdf(path: &Path) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create test directory");
+        }
+        fs::write(path, b"%PDF-1.4\n% test pdf\n").expect("write test pdf");
+    }
 
     fn test_paper(doi: Option<&str>, arxiv_id: Option<&str>) -> Paper {
         Paper {
@@ -4126,6 +4288,51 @@ mod tests {
             created_at: "0".to_string(),
             updated_at: "0".to_string(),
         }
+    }
+
+    #[test]
+    fn paper_pdf_source_path_prefers_current_pdf_path() {
+        let mut paper = test_paper(None, None);
+        paper.pdf_path = Some("/current.pdf".to_string());
+        paper.original_pdf_path = Some("/original.pdf".to_string());
+
+        assert_eq!(paper_pdf_source_path(&paper), Some("/current.pdf"));
+
+        paper.pdf_path = None;
+
+        assert_eq!(paper_pdf_source_path(&paper), Some("/original.pdf"));
+    }
+
+    #[test]
+    fn runtime_path_with_roots_recovers_legacy_relative_path() {
+        let root = temp_test_dir("legacy-relative");
+        let pdf_path = root.join("imports").join("legacy-paper.pdf");
+        write_test_pdf(&pdf_path);
+
+        let resolved = path_for_runtime_with_roots(
+            Path::new("imports/legacy-paper.pdf"),
+            std::slice::from_ref(&root),
+            std::slice::from_ref(&root),
+        );
+
+        assert_eq!(resolved, pdf_path);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runtime_path_with_roots_recovers_by_basename() {
+        let root = temp_test_dir("basename-search");
+        let pdf_path = root.join("nested").join("legacy-paper.pdf");
+        write_test_pdf(&pdf_path);
+
+        let resolved = path_for_runtime_with_roots(
+            Path::new("/old/location/legacy-paper.pdf"),
+            &[],
+            std::slice::from_ref(&root),
+        );
+
+        assert_eq!(resolved, pdf_path);
+        let _ = fs::remove_dir_all(root);
     }
 
     fn test_settings() -> Settings {
