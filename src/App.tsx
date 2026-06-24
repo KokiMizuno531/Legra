@@ -34,6 +34,9 @@ type Paper = {
   pdf_path?: string;
   original_pdf_path?: string;
   folder_category?: string;
+  pdf_status: "available" | "missing";
+  metadata_status: "resolved" | "incomplete";
+  file_fingerprint?: string;
   created_at: string;
   updated_at: string;
 };
@@ -57,6 +60,8 @@ type AppData = {
     workspace_root?: string;
     workspace_revision?: number;
     workspace_last_loaded_revision?: number;
+    managed_library_revision?: number;
+    managed_library_last_loaded_revision?: number;
     cloud_sync_expected: boolean;
     created_at: string;
     updated_at: string;
@@ -138,6 +143,23 @@ type ExtensionImportSummary = {
 type WorkspaceHealth = {
   ok: boolean;
   warnings: string[];
+};
+
+type LibrarySyncResult = {
+  data: AppData;
+  scanned: number;
+  added: number;
+  relinked: number;
+  missing: number;
+  metadata_resolved: number;
+  metadata_failed: number;
+  warnings: string[];
+};
+
+type LibrarySyncProgress = {
+  total: number;
+  completed: number;
+  phase: string;
 };
 
 type ChromeNativeHostStatus = {
@@ -395,7 +417,7 @@ function categoryMatchesFilter(category: string | undefined, filter: string) {
 }
 
 function App() {
-  const currentWindowLabel = getCurrentWebviewWindow().label;
+  const [currentWindowLabel, setCurrentWindowLabel] = useState("main");
   const isRegisterWindow = currentWindowLabel === "register-paper";
   const isSettingsWindow = currentWindowLabel === "settings";
   const editWindowPaperId = currentWindowLabel.startsWith("edit-paper-")
@@ -421,6 +443,7 @@ function App() {
     useState<ChromeNativeHostStatus | null>(null);
   const [importSource, setImportSource] = useState("");
   const [metadataLoading, setMetadataLoading] = useState(false);
+  const [librarySyncing, setLibrarySyncing] = useState(false);
   const [message, setMessage] = useState("Loading saved papers...");
   const [error, setError] = useState<string | null>(null);
 
@@ -429,6 +452,15 @@ function App() {
   const focusedPaper = allPapers.find((paper) => paper.id === focusedPaperId) ?? null;
   const utilityMenuRef = useRef<HTMLDivElement | null>(null);
   const importProcessingRef = useRef(false);
+  const librarySyncingRef = useRef(false);
+
+  useEffect(() => {
+    try {
+      setCurrentWindowLabel(getCurrentWebviewWindow().label || "main");
+    } catch {
+      setCurrentWindowLabel("main");
+    }
+  }, []);
 
   const availableTags = useMemo(
     () => Array.from(new Set(allPapers.flatMap((paper) => paper.tags))).sort(),
@@ -499,6 +531,55 @@ function App() {
       nextData.settings.journal_output_style || initialSettingsForm.journal_output_style,
     );
     setMessage(`Loaded ${nextData.papers.length} papers.`);
+    return nextData;
+  }
+
+  function applyLibrarySyncResult(result: LibrarySyncResult) {
+    setError(null);
+    setData(result.data);
+    setSettingsForm(settingsToForm(result.data.settings));
+    setMessage(
+      `Synced ${result.scanned} PDFs: ${result.added} added, ${result.relinked} relinked, ${result.missing} missing.`,
+    );
+    if (result.warnings.length > 0) {
+      setError(
+        `${result.warnings.length} sync warning${result.warnings.length === 1 ? "" : "s"}. ${result.metadata_failed} PDF${result.metadata_failed === 1 ? "" : "s"} need manual metadata review.`,
+      );
+    }
+  }
+
+  async function syncManagedLibrary(
+    options: { silent?: boolean } = {},
+    sourceData: AppData | null = data,
+  ) {
+    if (
+      librarySyncingRef.current ||
+      sourceData?.settings.workspace_root ||
+      !sourceData?.settings.managed_directory
+    ) {
+      return;
+    }
+    librarySyncingRef.current = true;
+    setLibrarySyncing(true);
+    if (!options.silent) {
+      setError(null);
+      setMessage("Syncing managed directory...");
+    }
+    try {
+      const result = await invoke<LibrarySyncResult>("sync_managed_library");
+      applyLibrarySyncResult(result);
+    } catch (reason) {
+      setError(String(reason));
+      setMessage("Could not sync managed directory.");
+    } finally {
+      librarySyncingRef.current = false;
+      setLibrarySyncing(false);
+    }
+  }
+
+  async function reloadAndSync() {
+    const nextData = await loadSavedData();
+    await syncManagedLibrary({}, nextData);
   }
 
   async function processExtensionImports(options: { silent?: boolean } = {}) {
@@ -563,14 +644,17 @@ function App() {
     }
 
     try {
-      const nextData = await invoke<AppData>("update_managed_directory", {
+      setLibrarySyncing(true);
+      setMessage("Opening and syncing managed directory...");
+      const result = await invoke<LibrarySyncResult>("activate_managed_library", {
         managedDirectory: selected,
       });
-      setData(nextData);
-      setMessage("Managed directory updated.");
+      applyLibrarySyncResult(result);
     } catch (reason) {
       setError(String(reason));
       setMessage("Could not update managed directory.");
+    } finally {
+      setLibrarySyncing(false);
     }
   }
 
@@ -954,6 +1038,15 @@ function App() {
     setError(null);
 
     try {
+      const managedDirectoryChanged =
+        optionalString(settingsForm.managed_directory) !== data?.settings.managed_directory;
+      let activationResult: LibrarySyncResult | null = null;
+      if (managedDirectoryChanged && settingsForm.managed_directory.trim()) {
+        setLibrarySyncing(true);
+        activationResult = await invoke<LibrarySyncResult>("activate_managed_library", {
+          managedDirectory: settingsForm.managed_directory.trim(),
+        });
+      }
       const nextData = await invoke<AppData>("update_settings", {
         input: {
           managed_directory: optionalString(settingsForm.managed_directory),
@@ -972,10 +1065,16 @@ function App() {
       });
       setData(nextData);
       setSettingsForm(settingsToForm(nextData.settings));
-      setMessage("Settings updated.");
+      setMessage(
+        activationResult
+          ? `Settings updated. Synced ${activationResult.scanned} PDFs with ${activationResult.added} added.`
+          : "Settings updated.",
+      );
     } catch (reason) {
       setError(String(reason));
       setMessage("Could not update settings.");
+    } finally {
+      setLibrarySyncing(false);
     }
   }
 
@@ -1079,7 +1178,7 @@ function App() {
         ? allPapers.find((paper) => paper.id === uniqueIds[0])?.title ?? "this paper"
         : `${uniqueIds.length} papers`;
     const confirmed = window.confirm(
-      `Delete ${label} from Legra? PDF and note files will remain on disk.`,
+      `Delete ${label}? Available PDFs and Legra-managed notes will be moved to the system Trash.`,
     );
     if (!confirmed) {
       return;
@@ -1238,10 +1337,16 @@ function App() {
   }
 
   useEffect(() => {
-    loadSavedData().catch((reason) => {
-      setError(String(reason));
-      setMessage("Failed to load saved data.");
-    });
+    loadSavedData()
+      .then((nextData) => {
+        if (!isRegisterWindow && !isEditWindow && !isSettingsWindow) {
+          return syncManagedLibrary({ silent: true }, nextData);
+        }
+      })
+      .catch((reason) => {
+        setError(String(reason));
+        setMessage("Failed to load saved data.");
+      });
   }, []);
 
   useEffect(() => {
@@ -1261,6 +1366,25 @@ function App() {
     return () => {
       window.clearInterval(interval);
     };
+  }, [isEditWindow, isRegisterWindow, isSettingsWindow]);
+
+  useEffect(() => {
+    if (isRegisterWindow || isEditWindow || isSettingsWindow) {
+      return;
+    }
+    let unlisten = () => {};
+    listen<LibrarySyncProgress>("paper-manager:library-sync-progress", ({ payload }) => {
+      setMessage(
+        payload.total > 0
+          ? `${payload.phase}: ${payload.completed}/${payload.total}`
+          : "Managed directory scan complete.",
+      );
+    })
+      .then((cleanup) => {
+        unlisten = cleanup;
+      })
+      .catch(() => {});
+    return () => unlisten();
   }, [isEditWindow, isRegisterWindow, isSettingsWindow]);
 
   useEffect(() => {
@@ -1364,8 +1488,8 @@ function App() {
             <p>{message}</p>
           </div>
           <div className="storage-actions">
-            <button type="button" className="secondary-action" onClick={loadSavedData}>
-              Reload
+            <button type="button" className="secondary-action" disabled={librarySyncing} onClick={reloadAndSync}>
+              {librarySyncing ? "Syncing..." : "Reload / Sync"}
             </button>
           </div>
         </section>
@@ -1741,8 +1865,8 @@ function App() {
             <p>{message}</p>
           </div>
           <div className="storage-actions">
-            <button type="button" className="secondary-action" onClick={loadSavedData}>
-              Reload
+            <button type="button" className="secondary-action" disabled={librarySyncing} onClick={reloadAndSync}>
+              {librarySyncing ? "Syncing..." : "Reload / Sync"}
             </button>
           </div>
         </section>
@@ -1973,8 +2097,8 @@ function App() {
             <button type="button" className="secondary-action" onClick={chooseManagedDirectory}>
               Set directory
             </button>
-            <button type="button" className="secondary-action" onClick={loadSavedData}>
-              Reload
+            <button type="button" className="secondary-action" disabled={librarySyncing} onClick={reloadAndSync}>
+              {librarySyncing ? "Syncing..." : "Reload / Sync"}
             </button>
           </div>
         </section>
@@ -2248,8 +2372,8 @@ function App() {
             <button type="button" className="secondary-action" onClick={openRegisterPaperWindow}>
               Register
             </button>
-            <button type="button" className="secondary-action" onClick={loadSavedData}>
-              Reload
+            <button type="button" className="secondary-action" disabled={librarySyncing} onClick={reloadAndSync}>
+              {librarySyncing ? "Syncing..." : "Reload / Sync"}
             </button>
             <div className="utility-menu" ref={utilityMenuRef}>
               <button
@@ -2429,10 +2553,18 @@ function App() {
                         type="button"
                         className="compact-paper-title"
                         onClick={() => setFocusedPaperId(paper.id)}
-                        onDoubleClick={() => openPaperPdf(paper.id)}
+                        onDoubleClick={() => {
+                          if (paper.pdf_status !== "missing") openPaperPdf(paper.id);
+                        }}
                       >
                         {paper.title}
                       </button>
+                      {paper.pdf_status === "missing" ? (
+                        <span className="sync-state-badge missing-badge">Missing</span>
+                      ) : null}
+                      {paper.metadata_status === "incomplete" ? (
+                        <span className="sync-state-badge incomplete-badge">Metadata incomplete</span>
+                      ) : null}
                     </div>
                   ))}
                 </div>
@@ -2506,7 +2638,7 @@ function App() {
                     <button
                       type="button"
                       className="pdf-open-button"
-                      disabled={!focusedPaper.pdf_path}
+                      disabled={!focusedPaper.pdf_path || focusedPaper.pdf_status === "missing"}
                       onClick={() => openPaperPdf(focusedPaper.id)}
                     >
                       Open PDF
@@ -2517,6 +2649,12 @@ function App() {
                     <span className={`status-badge status-${focusedPaper.status ?? "unread"}`}>
                       {focusedPaper.status ?? "unread"}
                     </span>
+                    {focusedPaper.pdf_status === "missing" ? (
+                      <span className="sync-state-badge missing-badge">Missing PDF</span>
+                    ) : null}
+                    {focusedPaper.metadata_status === "incomplete" ? (
+                      <span className="sync-state-badge incomplete-badge">Metadata incomplete</span>
+                    ) : null}
                   </div>
                   <div className="tag-row">
                     {focusedPaper.tags.length > 0 ? (

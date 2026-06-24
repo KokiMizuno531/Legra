@@ -432,6 +432,26 @@ label {
   text-transform: uppercase;
 }
 
+.sync-state-badge {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 0.16rem 0.48rem;
+  font-size: 0.72rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.missing-badge {
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+.incomplete-badge {
+  background: #fef3c7;
+  color: #92400e;
+}
+
 .status-unread { background: #f1f5f9; color: #64748b; }
 .status-reading { background: #fef3c7; color: #b45309; }
 .status-done { background: #dcfce7; color: #15803d; }

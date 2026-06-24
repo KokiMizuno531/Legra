@@ -101,6 +101,22 @@ Basic workflow:
 4. Link or create Markdown notes for the paper.
 5. Export selected papers as BibTeX when needed.
 
+### Managed directory sync
+
+Each managed directory is an independent Legra library. Legra stores shared catalog data under
+`.legra/library.json` and scans the directory when the app starts, when `Reload / Sync` is used,
+and immediately after `Set directory`.
+
+- PDFs added outside Legra are discovered recursively.
+- DOI and arXiv metadata is resolved from text in the first three pages when possible.
+- PDFs that disappear remain in the catalog with a `Missing` status.
+- Moving or renaming a PDF preserves its registration through a content fingerprint.
+- Paper metadata and Legra-managed notes use relative paths so the same Drive folder works on
+  another device.
+
+Image-only PDFs are not OCRed. They are added with the filename as a temporary title and marked
+`Metadata incomplete` for manual review.
+
 Build the frontend:
 
 ```sh

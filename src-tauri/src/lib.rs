@@ -1,9 +1,16 @@
+use regex::Regex;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
-    fs,
+    collections::{HashMap, HashSet},
+    fs::{self, File},
+    io::Read,
     path::{Path, PathBuf},
     process::Command,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        OnceLock,
+    },
     time::Duration,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -17,6 +24,15 @@ mod platform;
 
 const SETTINGS_MENU_ID: &str = "settings";
 const CHROME_NATIVE_HOST_NAME: &str = "app.legra.importer";
+const MANAGED_LIBRARY_SCHEMA_VERSION: u32 = 1;
+
+fn default_pdf_status() -> String {
+    "available".to_string()
+}
+
+fn default_metadata_status() -> String {
+    "resolved".to_string()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Paper {
@@ -42,6 +58,12 @@ struct Paper {
     pdf_path: Option<String>,
     original_pdf_path: Option<String>,
     folder_category: Option<String>,
+    #[serde(default = "default_pdf_status")]
+    pdf_status: String,
+    #[serde(default = "default_metadata_status")]
+    metadata_status: String,
+    #[serde(default)]
+    file_fingerprint: Option<String>,
     created_at: String,
     updated_at: String,
 }
@@ -231,6 +253,32 @@ struct WorkspaceHealth {
 }
 
 #[derive(Debug, Serialize)]
+struct LibrarySyncResult {
+    data: AppData,
+    scanned: usize,
+    added: usize,
+    relinked: usize,
+    missing: usize,
+    metadata_resolved: usize,
+    metadata_failed: usize,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LibrarySyncProgress {
+    total: usize,
+    completed: usize,
+    phase: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ManagedLibraryFile {
+    schema_version: u32,
+    revision: u64,
+    data: AppData,
+}
+
+#[derive(Debug, Serialize)]
 struct ChromeNativeHostStatus {
     installed: bool,
     manifest_path: String,
@@ -285,6 +333,10 @@ struct Settings {
     workspace_revision: Option<u64>,
     #[serde(default)]
     workspace_last_loaded_revision: Option<u64>,
+    #[serde(default)]
+    managed_library_revision: Option<u64>,
+    #[serde(default)]
+    managed_library_last_loaded_revision: Option<u64>,
     created_at: String,
     updated_at: String,
 }
@@ -388,6 +440,22 @@ fn workspace_lock_file(root: &Path) -> PathBuf {
     workspace_meta_dir(root).join("write.lock")
 }
 
+fn managed_library_meta_dir(root: &Path) -> PathBuf {
+    root.join(".legra")
+}
+
+fn managed_library_data_file(root: &Path) -> PathBuf {
+    managed_library_meta_dir(root).join("library.json")
+}
+
+fn managed_library_lock_file(root: &Path) -> PathBuf {
+    managed_library_meta_dir(root).join("write.lock")
+}
+
+fn managed_library_notes_dir(root: &Path) -> PathBuf {
+    managed_library_meta_dir(root).join("notes")
+}
+
 fn active_workspace_root(data: &AppData) -> Option<PathBuf> {
     data.settings
         .workspace_root
@@ -412,6 +480,14 @@ fn path_for_storage(data: &AppData, path: &Path) -> String {
     if let Some(root) = active_workspace_root(data) {
         if let Ok(relative) = path.strip_prefix(root) {
             return relative.to_string_lossy().into_owned();
+        }
+    }
+
+    if data.settings.managed_library_revision.is_some() {
+        if let Some(root) = data.settings.managed_directory.as_deref() {
+            if let Ok(relative) = path.strip_prefix(root) {
+                return relative.to_string_lossy().into_owned();
+            }
         }
     }
 
@@ -525,6 +601,12 @@ fn notes_dir() -> Result<PathBuf, String> {
     if let Ok(data) = load_or_default_app_data() {
         if let Some(root) = active_workspace_root(&data) {
             return Ok(workspace_notes_dir(&root));
+        }
+
+        if data.settings.managed_library_revision.is_some() {
+            if let Some(root) = data.settings.managed_directory.as_deref() {
+                return Ok(managed_library_notes_dir(Path::new(root)));
+            }
         }
 
         if let Some(path) = data.settings.note_directory.as_deref() {
@@ -731,19 +813,27 @@ fn ensure_setting_dir() -> Result<PathBuf, String> {
 }
 
 fn now_id() -> Result<String, String> {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| error.to_string())?
         .as_millis();
-    Ok(format!("paper-{millis}"))
+    Ok(format!(
+        "paper-{millis}-{}",
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ))
 }
 
 fn now_note_id() -> Result<String, String> {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| error.to_string())?
         .as_millis();
-    Ok(format!("note-{millis}"))
+    Ok(format!(
+        "note-{millis}-{}",
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ))
 }
 
 fn current_timestamp() -> Result<String, String> {
@@ -915,6 +1005,8 @@ fn default_settings(timestamp: &str) -> Settings {
         workspace_root: None,
         workspace_revision: None,
         workspace_last_loaded_revision: None,
+        managed_library_revision: None,
+        managed_library_last_loaded_revision: None,
         created_at: timestamp.to_string(),
         updated_at: timestamp.to_string(),
     }
@@ -956,6 +1048,8 @@ fn merge_local_settings_into_workspace(
     workspace_data.settings.workspace_root = Some(root.to_string_lossy().into_owned());
     let revision = workspace_data.settings.workspace_revision.unwrap_or(0);
     workspace_data.settings.workspace_last_loaded_revision = Some(revision);
+    workspace_data.settings.managed_library_revision = None;
+    workspace_data.settings.managed_library_last_loaded_revision = None;
 }
 
 fn workspace_data_for_storage(data: &AppData) -> AppData {
@@ -968,12 +1062,93 @@ fn workspace_data_for_storage(data: &AppData) -> AppData {
     workspace_data.settings.chrome_extension_id = None;
     workspace_data.settings.workspace_root = None;
     workspace_data.settings.workspace_last_loaded_revision = None;
+    workspace_data.settings.managed_library_revision = None;
+    workspace_data.settings.managed_library_last_loaded_revision = None;
     workspace_data
+}
+
+fn merge_local_settings_into_managed_library(
+    library_data: &mut AppData,
+    local_settings: &Settings,
+    root: &Path,
+    revision: u64,
+) {
+    library_data.settings.managed_directory = Some(root.to_string_lossy().into_owned());
+    library_data.settings.note_directory = Some(
+        managed_library_notes_dir(root)
+            .to_string_lossy()
+            .into_owned(),
+    );
+    library_data.settings.marktext_path = local_settings.marktext_path.clone();
+    library_data.settings.pdf_viewer_path = local_settings.pdf_viewer_path.clone();
+    library_data.settings.chrome_import_directory = local_settings.chrome_import_directory.clone();
+    library_data.settings.chrome_extension_id = local_settings.chrome_extension_id.clone();
+    library_data.settings.workspace_root = None;
+    library_data.settings.workspace_revision = None;
+    library_data.settings.workspace_last_loaded_revision = None;
+    library_data.settings.managed_library_revision = Some(revision);
+    library_data.settings.managed_library_last_loaded_revision = Some(revision);
+}
+
+fn managed_library_data_for_storage(data: &AppData, root: &Path) -> AppData {
+    let mut stored = data.clone();
+    for paper in &mut stored.papers {
+        if let Some(path) = paper.pdf_path.as_mut() {
+            let runtime = path_for_runtime(data, path);
+            if let Ok(relative) = runtime.strip_prefix(root) {
+                *path = relative.to_string_lossy().into_owned();
+            }
+        }
+        if let Some(path) = paper.original_pdf_path.as_mut() {
+            let runtime = path_for_runtime(data, path);
+            if let Ok(relative) = runtime.strip_prefix(root) {
+                *path = relative.to_string_lossy().into_owned();
+            }
+        }
+    }
+    for note in &mut stored.notes {
+        let runtime = path_for_runtime(data, &note.file_path);
+        if let Ok(relative) = runtime.strip_prefix(root) {
+            note.file_path = relative.to_string_lossy().into_owned();
+        }
+    }
+
+    stored.settings.managed_directory = None;
+    stored.settings.note_directory = None;
+    stored.settings.marktext_path = None;
+    stored.settings.pdf_viewer_path = None;
+    stored.settings.chrome_import_directory = None;
+    stored.settings.chrome_extension_id = None;
+    stored.settings.workspace_root = None;
+    stored.settings.workspace_revision = None;
+    stored.settings.workspace_last_loaded_revision = None;
+    stored.settings.managed_library_revision = None;
+    stored.settings.managed_library_last_loaded_revision = None;
+    stored
+}
+
+fn read_managed_library(root: &Path, local_settings: &Settings) -> Result<AppData, String> {
+    let path = managed_library_data_file(root);
+    let json = fs::read_to_string(path).map_err(|error| error.to_string())?;
+    let library: ManagedLibraryFile =
+        serde_json::from_str(&json).map_err(|error| error.to_string())?;
+    if library.schema_version > MANAGED_LIBRARY_SCHEMA_VERSION {
+        return Err("Managed library was created by a newer Legra version.".to_string());
+    }
+    let mut data = library.data;
+    merge_local_settings_into_managed_library(&mut data, local_settings, root, library.revision);
+    Ok(data)
 }
 
 fn load_or_default_app_data() -> Result<AppData, String> {
     let local_data = load_local_app_data()?;
     let Some(root) = active_workspace_root(&local_data) else {
+        if let Some(managed_directory) = local_data.settings.managed_directory.as_deref() {
+            let root = PathBuf::from(managed_directory);
+            if managed_library_data_file(&root).exists() {
+                return read_managed_library(&root, &local_data.settings);
+            }
+        }
         return Ok(local_data);
     };
 
@@ -1038,6 +1213,52 @@ fn save_data_file(data: &AppData) -> Result<AppStatus, String> {
             fs::write(&workspace_file, workspace_json).map_err(|error| error.to_string());
         let _ = fs::remove_file(&lock);
         write_result?;
+    } else if let Some(root_value) = next_data.settings.managed_directory.as_deref() {
+        let root = PathBuf::from(root_value);
+        if next_data.settings.managed_library_revision.is_some() {
+            fs::create_dir_all(managed_library_meta_dir(&root))
+                .map_err(|error| error.to_string())?;
+            let library_file = managed_library_data_file(&root);
+            let current_revision = if library_file.exists() {
+                let json = fs::read_to_string(&library_file).map_err(|error| error.to_string())?;
+                serde_json::from_str::<ManagedLibraryFile>(&json)
+                    .map_err(|error| error.to_string())?
+                    .revision
+            } else {
+                0
+            };
+            let loaded_revision = next_data
+                .settings
+                .managed_library_last_loaded_revision
+                .unwrap_or(current_revision);
+            if current_revision != loaded_revision {
+                return Err(
+                    "Managed library changed on disk. Reload before saving to avoid overwriting another device."
+                        .to_string(),
+                );
+            }
+
+            let lock = managed_library_lock_file(&root);
+            if lock.exists() {
+                return Err(
+                    "Managed library is locked by another save operation. Try again after Drive finishes syncing."
+                        .to_string(),
+                );
+            }
+            fs::write(&lock, current_timestamp()?).map_err(|error| error.to_string())?;
+            let next_revision = current_revision + 1;
+            next_data.settings.managed_library_revision = Some(next_revision);
+            next_data.settings.managed_library_last_loaded_revision = Some(next_revision);
+            let library = ManagedLibraryFile {
+                schema_version: MANAGED_LIBRARY_SCHEMA_VERSION,
+                revision: next_revision,
+                data: managed_library_data_for_storage(&next_data, &root),
+            };
+            let json = serde_json::to_string_pretty(&library).map_err(|error| error.to_string())?;
+            let write_result = fs::write(&library_file, json).map_err(|error| error.to_string());
+            let _ = fs::remove_file(&lock);
+            write_result?;
+        }
     }
 
     let local_json = serde_json::to_string_pretty(&next_data).map_err(|error| error.to_string())?;
@@ -1812,8 +2033,7 @@ fn normalize_pdf_storage_path(
     data: &AppData,
     pdf_path: &Option<String>,
 ) -> Result<Option<String>, String> {
-    Ok(resolve_pdf_path(data, pdf_path)?
-        .map(|path| path_for_storage(data, &path)))
+    Ok(resolve_pdf_path(data, pdf_path)?.map(|path| path_for_storage(data, &path)))
 }
 
 fn sanitize_filename(value: &str) -> String {
@@ -2277,7 +2497,7 @@ fn ensure_workspace_dirs(root: &Path) -> Result<(), String> {
 }
 
 fn bibtex_escape(value: &str) -> String {
-    value.replace('\n', " ").replace('\r', " ")
+    value.replace(['\n', '\r'], " ")
 }
 
 fn normalize_journal_key(value: &str) -> String {
@@ -2491,8 +2711,426 @@ fn is_pdf_path(file_path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn collect_managed_pdfs(
+    root: &Path,
+    current: &Path,
+    files: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    for entry in fs::read_dir(current).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let file_type = entry.file_type().map_err(|error| error.to_string())?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        if file_type.is_dir() {
+            if path != root && path.file_name().and_then(|value| value.to_str()) == Some(".legra") {
+                continue;
+            }
+            collect_managed_pdfs(root, &path, files)?;
+        } else if file_type.is_file() && is_pdf_path(&path) {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn file_fingerprint(path: &Path) -> Result<String, String> {
+    let mut file = File::open(path).map_err(|error| error.to_string())?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn managed_relative_key(root: &Path, path: &Path) -> Option<String> {
+    let relative = if path.is_absolute() {
+        path.strip_prefix(root).ok()?
+    } else {
+        path
+    };
+    Some(
+        relative
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy().to_lowercase())
+            .collect::<Vec<_>>()
+            .join("/"),
+    )
+}
+
+fn paper_managed_key(data: &AppData, root: &Path, paper: &Paper) -> Option<String> {
+    let stored = paper
+        .pdf_path
+        .as_deref()
+        .or(paper.original_pdf_path.as_deref())?;
+    let stored_path = PathBuf::from(stored);
+    if stored_path.is_absolute() {
+        managed_relative_key(root, &stored_path)
+    } else {
+        managed_relative_key(root, &stored_path).or_else(|| {
+            let runtime = path_for_runtime(data, stored);
+            managed_relative_key(root, &runtime)
+        })
+    }
+}
+
+fn category_for_managed_pdf(root: &Path, path: &Path) -> Option<String> {
+    let parent = path.strip_prefix(root).ok()?.parent()?;
+    let parts = parent
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    (!parts.is_empty()).then(|| parts.join("/"))
+}
+
+fn doi_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(r"(?i)\b10\.\d{4,9}/[-._;()/:A-Z0-9]+").expect("valid DOI regex")
+    })
+}
+
+fn arxiv_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| {
+        Regex::new(r"(?i)(?:arxiv\s*:\s*|arxiv\.org/(?:abs|pdf)/)?(\d{4}\.\d{4,5})(?:v\d+)?")
+            .expect("valid arXiv regex")
+    })
+}
+
+fn identifiers_from_text(text: &str) -> (Option<String>, Option<String>) {
+    let mut dois = doi_regex()
+        .find_iter(text)
+        .map(|value| normalize_doi(value.as_str().trim_end_matches([',', ';', ')', ']', '}'])))
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    dois.sort();
+    dois.dedup();
+
+    let mut arxiv_ids = arxiv_regex()
+        .captures_iter(text)
+        .filter_map(|capture| {
+            capture
+                .get(1)
+                .map(|value| normalize_arxiv_id(value.as_str()))
+        })
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    arxiv_ids.sort();
+    arxiv_ids.dedup();
+
+    (
+        (dois.len() == 1).then(|| dois[0].clone()),
+        (arxiv_ids.len() == 1).then(|| arxiv_ids[0].clone()),
+    )
+}
+
+fn detected_pdf_identifier(path: &Path) -> Result<(Option<String>, Option<String>), String> {
+    let file_name = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
+    let pages = pdf_extract::extract_text_by_pages(path).map_err(|error| error.to_string())?;
+    let text = std::iter::once(file_name.to_string())
+        .chain(pages.into_iter().take(3))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(identifiers_from_text(&text))
+}
+
+fn metadata_for_discovered_pdf(path: &Path) -> Result<PaperMetadata, String> {
+    let (doi, arxiv_id) = detected_pdf_identifier(path)?;
+    if let Some(doi) = doi {
+        if !doi.to_ascii_lowercase().starts_with("10.48550/arxiv.") {
+            return fetch_crossref_metadata(&doi);
+        }
+    }
+    if let Some(arxiv_id) = arxiv_id {
+        return fetch_arxiv_metadata(&arxiv_id);
+    }
+    Err("No unambiguous DOI or arXiv ID was found in the first three pages.".to_string())
+}
+
+fn discovered_paper(
+    path: &Path,
+    root: &Path,
+    fingerprint: String,
+) -> Result<(Paper, bool, Option<String>), String> {
+    let timestamp = current_timestamp()?;
+    let fallback_title = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("Untitled PDF")
+        .to_string();
+    let relative = path.strip_prefix(root).map_err(|error| error.to_string())?;
+    let metadata_result = metadata_for_discovered_pdf(path);
+    let (metadata, resolved, warning) = match metadata_result {
+        Ok(metadata) => (Some(metadata), true, None),
+        Err(error) => (
+            None,
+            false,
+            Some(format!("{}: {error}", relative.to_string_lossy())),
+        ),
+    };
+    let metadata = metadata.unwrap_or(PaperMetadata {
+        title: Some(fallback_title.clone()),
+        authors: Vec::new(),
+        year: None,
+        publication: None,
+        volume: None,
+        issue: None,
+        pages: None,
+        numpages: None,
+        month: None,
+        publisher: None,
+        doi: None,
+        arxiv_id: None,
+        url: None,
+        abstract_text: None,
+    });
+    Ok((
+        Paper {
+            id: now_id()?,
+            title: metadata.title.unwrap_or(fallback_title),
+            authors: metadata.authors,
+            year: metadata.year,
+            publication: metadata.publication,
+            volume: metadata.volume,
+            issue: metadata.issue,
+            pages: metadata.pages,
+            numpages: metadata.numpages,
+            month: metadata.month,
+            publisher: metadata.publisher,
+            doi: metadata.doi,
+            arxiv_id: metadata.arxiv_id,
+            url: metadata.url,
+            abstract_text: metadata.abstract_text,
+            tags: Vec::new(),
+            status: Some("unread".to_string()),
+            rating: None,
+            bibtex_key: None,
+            pdf_path: Some(relative.to_string_lossy().into_owned()),
+            original_pdf_path: Some(relative.to_string_lossy().into_owned()),
+            folder_category: category_for_managed_pdf(root, path),
+            pdf_status: "available".to_string(),
+            metadata_status: if resolved { "resolved" } else { "incomplete" }.to_string(),
+            file_fingerprint: Some(fingerprint),
+            created_at: timestamp.clone(),
+            updated_at: timestamp,
+        },
+        resolved,
+        warning,
+    ))
+}
+
+fn copy_external_notes_into_managed_library(data: &mut AppData, root: &Path) -> Result<(), String> {
+    let notes_root = managed_library_notes_dir(root);
+    fs::create_dir_all(&notes_root).map_err(|error| error.to_string())?;
+    for note in &mut data.notes {
+        let source = PathBuf::from(&note.file_path);
+        if !source.exists() || !source.is_file() || source.starts_with(root) {
+            continue;
+        }
+        let destination_dir = notes_root.join(&note.paper_id);
+        fs::create_dir_all(&destination_dir).map_err(|error| error.to_string())?;
+        let file_name = source.file_name().unwrap_or_default();
+        let destination = unique_path(&destination_dir, &file_name.to_string_lossy());
+        fs::copy(&source, &destination).map_err(|error| error.to_string())?;
+        note.file_path = destination
+            .strip_prefix(root)
+            .map_err(|error| error.to_string())?
+            .to_string_lossy()
+            .into_owned();
+    }
+    Ok(())
+}
+
+fn sync_managed_library_data(
+    mut data: AppData,
+    root: &Path,
+    app: Option<&tauri::AppHandle>,
+) -> Result<LibrarySyncResult, String> {
+    fs::create_dir_all(managed_library_meta_dir(root)).map_err(|error| error.to_string())?;
+    let initializing_library = data.settings.managed_library_revision.is_none();
+    data.settings.managed_directory = Some(root.to_string_lossy().into_owned());
+    data.settings.note_directory = Some(
+        managed_library_notes_dir(root)
+            .to_string_lossy()
+            .into_owned(),
+    );
+    data.settings.workspace_root = None;
+    data.settings.workspace_revision = None;
+    data.settings.workspace_last_loaded_revision = None;
+    if data.settings.managed_library_revision.is_none() {
+        data.settings.managed_library_revision = Some(0);
+        data.settings.managed_library_last_loaded_revision = Some(0);
+    }
+    if initializing_library {
+        copy_external_notes_into_managed_library(&mut data, root)?;
+    }
+
+    let mut pdfs = Vec::new();
+    collect_managed_pdfs(root, root, &mut pdfs)?;
+    pdfs.sort();
+    let existing_keys = data
+        .papers
+        .iter()
+        .map(|paper| paper_managed_key(&data, root, paper))
+        .collect::<Vec<_>>();
+    for paper in &mut data.papers {
+        if paper.pdf_path.is_some() || paper.original_pdf_path.is_some() {
+            paper.pdf_status = "missing".to_string();
+        }
+    }
+
+    let mut matched = HashSet::new();
+    let mut added = 0;
+    let mut relinked = 0;
+    let mut metadata_resolved = 0;
+    let mut metadata_failed = 0;
+    let mut warnings = Vec::new();
+    let mut new_files = Vec::new();
+
+    for path in &pdfs {
+        let relative = path.strip_prefix(root).map_err(|error| error.to_string())?;
+        let key = managed_relative_key(root, relative).unwrap_or_default();
+        let mut paper_index = existing_keys
+            .iter()
+            .enumerate()
+            .find(|(index, existing)| {
+                !matched.contains(index) && existing.as_deref() == Some(key.as_str())
+            })
+            .map(|(index, _)| index);
+        let fingerprint = match paper_index
+            .and_then(|index| data.papers[index].file_fingerprint.clone())
+            .map(Ok)
+            .unwrap_or_else(|| file_fingerprint(path))
+        {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => {
+                warnings.push(format!(
+                    "Could not read {}. Wait for Drive to finish downloading it, then reload: {error}",
+                    relative.to_string_lossy()
+                ));
+                continue;
+            }
+        };
+
+        if paper_index.is_none() {
+            let candidates = data
+                .papers
+                .iter()
+                .enumerate()
+                .filter(|(index, paper)| {
+                    !matched.contains(index)
+                        && paper.file_fingerprint.as_deref() == Some(&fingerprint)
+                })
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            if candidates.len() == 1 {
+                paper_index = candidates.first().copied();
+                relinked += 1;
+            }
+        }
+
+        if let Some(index) = paper_index {
+            matched.insert(index);
+            let paper = &mut data.papers[index];
+            paper.pdf_path = Some(relative.to_string_lossy().into_owned());
+            paper.folder_category = category_for_managed_pdf(root, path);
+            paper.pdf_status = "available".to_string();
+            paper.file_fingerprint = Some(fingerprint);
+            continue;
+        }
+
+        new_files.push((path.clone(), fingerprint));
+    }
+
+    if let Some(app) = app {
+        let _ = app.emit(
+            "paper-manager:library-sync-progress",
+            LibrarySyncProgress {
+                total: new_files.len(),
+                completed: 0,
+                phase: "Extracting metadata".to_string(),
+            },
+        );
+    }
+
+    let mut completed = 0;
+    for chunk in new_files.chunks(4) {
+        let discovered = std::thread::scope(|scope| {
+            let handles = chunk
+                .iter()
+                .map(|(path, fingerprint)| {
+                    scope.spawn(move || discovered_paper(path, root, fingerprint.clone()))
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .map_err(|_| "PDF metadata worker panicked.".to_string())?
+                })
+                .collect::<Result<Vec<_>, String>>()
+        })?;
+        for (paper, resolved, warning) in discovered {
+            if resolved {
+                metadata_resolved += 1;
+            } else {
+                metadata_failed += 1;
+            }
+            if let Some(warning) = warning {
+                warnings.push(warning);
+            }
+            data.papers.push(paper);
+            added += 1;
+        }
+        completed += chunk.len();
+        if let Some(app) = app {
+            let _ = app.emit(
+                "paper-manager:library-sync-progress",
+                LibrarySyncProgress {
+                    total: new_files.len(),
+                    completed,
+                    phase: "Extracting metadata".to_string(),
+                },
+            );
+        }
+    }
+
+    let missing = data
+        .papers
+        .iter()
+        .filter(|paper| paper.pdf_status == "missing")
+        .count();
+    data.settings.updated_at = current_timestamp()?;
+    save_data_file(&data)?;
+    let data = load_or_default_app_data()?;
+    Ok(LibrarySyncResult {
+        data,
+        scanned: pdfs.len(),
+        added,
+        relinked,
+        missing,
+        metadata_resolved,
+        metadata_failed,
+        warnings,
+    })
+}
+
 fn paper_pdf_source_path(paper: &Paper) -> Option<&str> {
-    paper.pdf_path.as_deref().or(paper.original_pdf_path.as_deref())
+    paper
+        .pdf_path
+        .as_deref()
+        .or(paper.original_pdf_path.as_deref())
 }
 
 fn paper_pdf_runtime_path(data: &AppData, paper: &Paper) -> Result<PathBuf, String> {
@@ -2611,6 +3249,9 @@ fn register_paper_input(input: RegisterPaperInput) -> Result<AppData, String> {
         pdf_path: pdf_path.clone(),
         original_pdf_path: pdf_path,
         folder_category: normalize_optional(input.folder_category),
+        pdf_status: default_pdf_status(),
+        metadata_status: default_metadata_status(),
+        file_fingerprint: None,
         created_at: timestamp.clone(),
         updated_at: timestamp,
     };
@@ -2686,6 +3327,9 @@ fn register_or_update_import_input_into_data(
             pdf_path: valid_pdf_path.clone(),
             original_pdf_path: valid_pdf_path,
             folder_category: normalize_optional(input.folder_category),
+            pdf_status: default_pdf_status(),
+            metadata_status: default_metadata_status(),
+            file_fingerprint: None,
             created_at: timestamp.clone(),
             updated_at: timestamp,
         };
@@ -3255,8 +3899,8 @@ fn process_extension_imports(app: tauri::AppHandle) -> Result<ExtensionImportSum
             }
             Err(error) => {
                 failed += 1;
-                cleanup_extension_download_from_request_file(&path);
-                let failed_path = move_import_file(&path, &extension_import_failed_dir()?)?;
+                cleanup_extension_download_from_request_file(path);
+                let failed_path = move_import_file(path, &extension_import_failed_dir()?)?;
                 let error_path = failed_path.with_extension("error.txt");
                 fs::write(&error_path, &error).map_err(|write_error| write_error.to_string())?;
                 messages.push(format!(
@@ -3395,13 +4039,7 @@ fn update_paper(app: tauri::AppHandle, input: UpdatePaperInput) -> Result<AppDat
 
     let mut data = load_or_default_app_data()?;
     let pdf_path = normalize_pdf_storage_path(&data, &input.pdf_path)?;
-    ensure_not_duplicate(
-        &data,
-        Some(&input.id),
-        &input.title,
-        &input.doi,
-        &pdf_path,
-    )?;
+    ensure_not_duplicate(&data, Some(&input.id), &input.title, &input.doi, &pdf_path)?;
 
     let timestamp = current_timestamp()?;
     let paper = data
@@ -3446,6 +4084,51 @@ fn update_managed_directory(
     app: tauri::AppHandle,
     managed_directory: String,
 ) -> Result<AppData, String> {
+    Ok(activate_managed_library(app, managed_directory)?.data)
+}
+
+fn data_for_new_managed_library(mut data: AppData, root: &Path) -> Result<AppData, String> {
+    let same_library = data
+        .settings
+        .managed_directory
+        .as_deref()
+        .is_some_and(|value| Path::new(value) == root);
+    if !same_library {
+        let retained_ids = data
+            .papers
+            .iter()
+            .filter_map(|paper| {
+                let stored = paper
+                    .pdf_path
+                    .as_deref()
+                    .or(paper.original_pdf_path.as_deref())?;
+                let runtime = path_for_runtime(&data, stored);
+                runtime.starts_with(root).then(|| paper.id.clone())
+            })
+            .collect::<HashSet<_>>();
+        data.papers.retain(|paper| retained_ids.contains(&paper.id));
+        data.notes
+            .retain(|note| retained_ids.contains(&note.paper_id));
+    }
+    data.settings.managed_directory = Some(root.to_string_lossy().into_owned());
+    data.settings.note_directory = Some(
+        managed_library_notes_dir(root)
+            .to_string_lossy()
+            .into_owned(),
+    );
+    data.settings.workspace_root = None;
+    data.settings.workspace_revision = None;
+    data.settings.workspace_last_loaded_revision = None;
+    data.settings.managed_library_revision = None;
+    data.settings.managed_library_last_loaded_revision = None;
+    Ok(data)
+}
+
+#[tauri::command]
+fn activate_managed_library(
+    app: tauri::AppHandle,
+    managed_directory: String,
+) -> Result<LibrarySyncResult, String> {
     let path = PathBuf::from(managed_directory.trim());
     if !path.exists() {
         return Err("Managed directory does not exist.".to_string());
@@ -3455,13 +4138,64 @@ fn update_managed_directory(
         return Err("Managed directory is not a directory.".to_string());
     }
 
-    let mut data = load_or_default_app_data()?;
-    let timestamp = current_timestamp()?;
-    data.settings.managed_directory = Some(path.to_string_lossy().into_owned());
-    data.settings.updated_at = timestamp;
-    save_data_file(&data)?;
+    if workspace_data_file(&path).exists() {
+        let data = open_shared_workspace(
+            app.clone(),
+            WorkspaceInput {
+                workspace_dir: path.to_string_lossy().into_owned(),
+            },
+        )?;
+        return Ok(LibrarySyncResult {
+            data,
+            scanned: 0,
+            added: 0,
+            relinked: 0,
+            missing: 0,
+            metadata_resolved: 0,
+            metadata_failed: 0,
+            warnings: Vec::new(),
+        });
+    }
+
+    let local_data = load_local_app_data()?;
+    let data = if managed_library_data_file(&path).exists() {
+        read_managed_library(&path, &local_data.settings)?
+    } else {
+        data_for_new_managed_library(load_or_default_app_data()?, &path)?
+    };
+    let result = sync_managed_library_data(data, &path, Some(&app))?;
     let _ = app.emit("paper-manager:data-updated", ());
-    Ok(data)
+    Ok(result)
+}
+
+#[tauri::command]
+fn sync_managed_library(app: tauri::AppHandle) -> Result<LibrarySyncResult, String> {
+    let data = load_or_default_app_data()?;
+    if active_workspace_root(&data).is_some() {
+        return Ok(LibrarySyncResult {
+            missing: data
+                .papers
+                .iter()
+                .filter(|paper| paper.pdf_status == "missing")
+                .count(),
+            scanned: data.papers.len(),
+            data,
+            added: 0,
+            relinked: 0,
+            metadata_resolved: 0,
+            metadata_failed: 0,
+            warnings: vec!["Structured workspaces continue to use Workspace reload.".to_string()],
+        });
+    }
+    let root = data
+        .settings
+        .managed_directory
+        .as_deref()
+        .map(PathBuf::from)
+        .ok_or_else(|| "Managed directory is not set.".to_string())?;
+    let result = sync_managed_library_data(data, &root, Some(&app))?;
+    let _ = app.emit("paper-manager:data-updated", ());
+    Ok(result)
 }
 
 #[tauri::command]
@@ -3556,7 +4290,15 @@ fn update_settings(app: tauri::AppHandle, input: UpdateSettingsInput) -> Result<
     }
 
     let mut data = load_or_default_app_data()?;
+    let managed_directory_changed = data.settings.managed_directory != managed_directory;
     data.settings.managed_directory = managed_directory;
+    if managed_directory_changed {
+        data.settings.workspace_root = None;
+        data.settings.workspace_revision = None;
+        data.settings.workspace_last_loaded_revision = None;
+        data.settings.managed_library_revision = None;
+        data.settings.managed_library_last_loaded_revision = None;
+    }
     data.settings.note_directory = note_directory;
     data.settings.chrome_import_directory = chrome_import_directory;
     data.settings.chrome_extension_id = chrome_extension_id;
@@ -3764,6 +4506,41 @@ fn delete_papers(app: tauri::AppHandle, input: DeletePapersInput) -> Result<AppD
         return Err(format!("Paper was not found: {}", missing.join(", ")));
     }
 
+    let mut paths_to_trash = Vec::new();
+    for paper in data
+        .papers
+        .iter()
+        .filter(|paper| paper_ids.contains(&paper.id))
+    {
+        if let Some(stored_path) = paper
+            .pdf_path
+            .as_deref()
+            .or(paper.original_pdf_path.as_deref())
+        {
+            let path = path_for_runtime(&data, stored_path);
+            if path.exists() && !paths_to_trash.contains(&path) {
+                paths_to_trash.push(path);
+            }
+        }
+        for note in data.notes.iter().filter(|note| note.paper_id == paper.id) {
+            let path = path_for_runtime(&data, &note.file_path);
+            let managed_by_legra = active_workspace_root(&data)
+                .is_some_and(|root| path.starts_with(root))
+                || data
+                    .settings
+                    .managed_directory
+                    .as_deref()
+                    .is_some_and(|root| path.starts_with(root));
+            if managed_by_legra && path.exists() && !paths_to_trash.contains(&path) {
+                paths_to_trash.push(path);
+            }
+        }
+    }
+    if !paths_to_trash.is_empty() {
+        trash::delete_all(&paths_to_trash)
+            .map_err(|error| format!("Could not move files to the system Trash: {error}"))?;
+    }
+
     data.papers.retain(|paper| !paper_ids.contains(&paper.id));
     data.notes
         .retain(|note| !paper_ids.contains(&note.paper_id));
@@ -3919,7 +4696,7 @@ fn create_shared_workspace(
     data.settings.updated_at = timestamp;
     save_data_file(&data)?;
     let _ = app.emit("paper-manager:data-updated", ());
-    Ok(load_or_default_app_data()?)
+    load_or_default_app_data()
 }
 
 #[tauri::command]
@@ -3943,7 +4720,7 @@ fn open_shared_workspace(app: tauri::AppHandle, input: WorkspaceInput) -> Result
     fs::create_dir_all(setting_dir()?).map_err(|error| error.to_string())?;
     fs::write(data_file_path()?, local_json).map_err(|error| error.to_string())?;
     let _ = app.emit("paper-manager:data-updated", ());
-    Ok(load_or_default_app_data()?)
+    load_or_default_app_data()
 }
 
 #[tauri::command]
@@ -3988,7 +4765,7 @@ fn convert_current_library_to_workspace(
 
     save_data_file(&data)?;
     let _ = app.emit("paper-manager:data-updated", ());
-    Ok(load_or_default_app_data()?)
+    load_or_default_app_data()
 }
 
 #[tauri::command]
@@ -4084,7 +4861,27 @@ fn link_note(input: LinkNoteInput) -> Result<AppData, String> {
         return Err("Selected note path is not a file.".to_string());
     }
 
-    let normalized_path = path_for_storage(&data, &path);
+    let managed_path = if data.settings.managed_library_revision.is_some() {
+        let root = data
+            .settings
+            .managed_directory
+            .as_deref()
+            .map(PathBuf::from)
+            .ok_or_else(|| "Managed directory is not set.".to_string())?;
+        if path.starts_with(&root) {
+            path.clone()
+        } else {
+            let destination_dir = managed_library_notes_dir(&root).join(&input.paper_id);
+            fs::create_dir_all(&destination_dir).map_err(|error| error.to_string())?;
+            let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+            let destination = unique_path(&destination_dir, &file_name);
+            fs::copy(&path, &destination).map_err(|error| error.to_string())?;
+            destination
+        }
+    } else {
+        path.clone()
+    };
+    let normalized_path = path_for_storage(&data, &managed_path);
     if data
         .notes
         .iter()
@@ -4101,7 +4898,7 @@ fn link_note(input: LinkNoteInput) -> Result<AppData, String> {
         paper_id: input.paper_id,
         title,
         file_path: normalized_path,
-        file_type: note_file_type(&path),
+        file_type: note_file_type(&managed_path),
         summary: None,
         created_at: timestamp.clone(),
         updated_at: timestamp,
@@ -4128,11 +4925,11 @@ fn open_path_with_application(
             .status()
             .map_err(|error| error.to_string())?;
 
-        return if status.success() {
+        if status.success() {
             Ok(())
         } else {
             Err(format!("Could not open file with {app}."))
-        };
+        }
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -4192,8 +4989,8 @@ fn open_paper_pdf(app: tauri::AppHandle, paper_id: String) -> Result<(), String>
     let pdf_path = paper_pdf_runtime_path(&data, &data.papers[paper_index])?;
 
     let repaired_storage_path = path_for_storage(&data, &pdf_path);
-    let needs_repair = data.papers[paper_index].pdf_path.as_deref()
-        != Some(repaired_storage_path.as_str());
+    let needs_repair =
+        data.papers[paper_index].pdf_path.as_deref() != Some(repaired_storage_path.as_str());
     if needs_repair {
         let mut repaired_data = data.clone();
         let paper_title = repaired_data.papers[paper_index].title.clone();
@@ -4238,6 +5035,7 @@ fn check_note_files() -> Result<Vec<NoteStatus>, String> {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use std::{
@@ -4285,6 +5083,9 @@ mod tests {
             pdf_path: None,
             original_pdf_path: None,
             folder_category: None,
+            pdf_status: default_pdf_status(),
+            metadata_status: default_metadata_status(),
+            file_fingerprint: None,
             created_at: "0".to_string(),
             updated_at: "0".to_string(),
         }
@@ -4353,9 +5154,113 @@ mod tests {
             workspace_root: None,
             workspace_revision: None,
             workspace_last_loaded_revision: None,
+            managed_library_revision: None,
+            managed_library_last_loaded_revision: None,
             created_at: "0".to_string(),
             updated_at: "0".to_string(),
         }
+    }
+
+    #[test]
+    fn managed_pdf_scan_is_recursive_and_skips_internal_directory() {
+        let root = temp_test_dir("managed-scan");
+        let visible = root.join("physics").join("paper.PDF");
+        let internal = root.join(".legra").join("notes").join("attachment.pdf");
+        write_test_pdf(&visible);
+        write_test_pdf(&internal);
+
+        let mut files = Vec::new();
+        collect_managed_pdfs(&root, &root, &mut files).unwrap();
+
+        assert_eq!(files, vec![visible]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fingerprint_survives_external_rename() {
+        let root = temp_test_dir("fingerprint");
+        let first = root.join("first.pdf");
+        let second = root.join("renamed.pdf");
+        write_test_pdf(&first);
+        let before = file_fingerprint(&first).unwrap();
+        fs::rename(&first, &second).unwrap();
+        let after = file_fingerprint(&second).unwrap();
+
+        assert_eq!(before, after);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn identifier_detection_requires_an_unambiguous_candidate() {
+        let (doi, arxiv) = identifiers_from_text(
+            "Published as DOI: 10.1000/example.1 and preprint arXiv:2507.02793v2",
+        );
+        assert_eq!(doi.as_deref(), Some("10.1000/example.1"));
+        assert_eq!(arxiv.as_deref(), Some("2507.02793"));
+
+        let (doi, _) = identifiers_from_text("10.1000/first 10.1000/second");
+        assert_eq!(doi, None);
+    }
+
+    #[test]
+    fn managed_library_storage_uses_relative_paths_and_excludes_local_settings() {
+        let root = temp_test_dir("managed-storage");
+        let pdf = root.join("category").join("paper.pdf");
+        let note = root.join(".legra").join("notes").join("paper.md");
+        write_test_pdf(&pdf);
+        fs::create_dir_all(note.parent().unwrap()).unwrap();
+        fs::write(&note, "# Note").unwrap();
+
+        let mut settings = test_settings();
+        settings.managed_directory = Some(root.to_string_lossy().into_owned());
+        settings.managed_library_revision = Some(2);
+        settings.managed_library_last_loaded_revision = Some(2);
+        settings.marktext_path = Some("local-editor".to_string());
+        let mut paper = test_paper(None, None);
+        paper.pdf_path = Some(pdf.to_string_lossy().into_owned());
+        let data = AppData {
+            papers: vec![paper],
+            notes: vec![Note {
+                id: "note-test".to_string(),
+                paper_id: "paper-test".to_string(),
+                title: "Note".to_string(),
+                file_path: note.to_string_lossy().into_owned(),
+                file_type: Some("md".to_string()),
+                summary: None,
+                created_at: "0".to_string(),
+                updated_at: "0".to_string(),
+            }],
+            settings,
+        };
+
+        let stored = managed_library_data_for_storage(&data, &root);
+        assert_eq!(
+            Path::new(stored.papers[0].pdf_path.as_deref().unwrap()),
+            Path::new("category").join("paper.pdf")
+        );
+        assert_eq!(
+            Path::new(&stored.notes[0].file_path),
+            Path::new(".legra").join("notes").join("paper.md")
+        );
+        assert_eq!(stored.settings.managed_directory, None);
+        assert_eq!(stored.settings.marktext_path, None);
+        assert_eq!(stored.settings.managed_library_revision, None);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_paper_json_defaults_sync_status_fields() {
+        let paper = test_paper(None, None);
+        let mut value = serde_json::to_value(paper).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("pdf_status");
+        object.remove("metadata_status");
+        object.remove("file_fingerprint");
+
+        let decoded: Paper = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.pdf_status, "available");
+        assert_eq!(decoded.metadata_status, "resolved");
+        assert_eq!(decoded.file_fingerprint, None);
     }
 
     #[test]
@@ -4568,6 +5473,10 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             repair_existing_chrome_native_host(app.handle());
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
             Ok(())
         })
         .menu(|app| {
@@ -4637,6 +5546,8 @@ pub fn run() {
             register_paper,
             update_paper,
             update_managed_directory,
+            activate_managed_library,
+            sync_managed_library,
             resolve_folder_category,
             update_settings,
             check_chrome_native_host,
