@@ -11,6 +11,8 @@ use std::{
 #[path = "../platform.rs"]
 mod platform;
 
+const MANAGED_LIBRARY_SCHEMA_VERSION: u32 = 1;
+
 #[derive(Debug, Deserialize)]
 struct Paper {
     folder_category: Option<String>,
@@ -26,6 +28,13 @@ struct Settings {
 struct AppData {
     papers: Vec<Paper>,
     settings: Settings,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManagedLibraryFile {
+    schema_version: u32,
+    revision: u64,
+    data: AppData,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -103,6 +112,10 @@ fn workspace_papers_dir(root: &Path) -> PathBuf {
     root.join("papers")
 }
 
+fn managed_library_data_file(root: &Path) -> PathBuf {
+    root.join(".legra").join("library.json")
+}
+
 fn now_millis() -> Result<u128, String> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -141,6 +154,22 @@ fn write_import_request(mut request: ExtensionImportRequest) -> Result<PathBuf, 
     Ok(path)
 }
 
+fn read_managed_library(root: &Path) -> Result<AppData, String> {
+    let json =
+        fs::read_to_string(managed_library_data_file(root)).map_err(|error| error.to_string())?;
+    let library: ManagedLibraryFile =
+        serde_json::from_str(&json).map_err(|error| error.to_string())?;
+    if library.schema_version > MANAGED_LIBRARY_SCHEMA_VERSION {
+        return Err("Managed library was created by a newer Legra version.".to_string());
+    }
+
+    let _revision = library.revision;
+    let mut data = library.data;
+    data.settings.managed_directory = Some(root.to_string_lossy().into_owned());
+    data.settings.workspace_root = None;
+    Ok(data)
+}
+
 fn read_app_data() -> Result<Option<AppData>, String> {
     let data_file = data_file_path()?;
     if !data_file.exists() {
@@ -149,31 +178,46 @@ fn read_app_data() -> Result<Option<AppData>, String> {
 
     let json = fs::read_to_string(&data_file).map_err(|error| error.to_string())?;
     let local_data: AppData = serde_json::from_str(&json).map_err(|error| error.to_string())?;
-    let Some(workspace_root) = local_data
+    let workspace_root = local_data
         .settings
         .workspace_root
         .as_deref()
         .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return Ok(Some(local_data));
-    };
+        .filter(|value| !value.is_empty());
 
-    let workspace_file = workspace_data_file(Path::new(workspace_root));
-    if !workspace_file.exists() {
-        return Ok(Some(local_data));
+    if let Some(workspace_root) = workspace_root {
+        let workspace_file = workspace_data_file(Path::new(workspace_root));
+        if !workspace_file.exists() {
+            return Ok(Some(local_data));
+        }
+
+        let workspace_json =
+            fs::read_to_string(&workspace_file).map_err(|error| error.to_string())?;
+        let mut workspace_data: AppData =
+            serde_json::from_str(&workspace_json).map_err(|error| error.to_string())?;
+        workspace_data.settings.workspace_root = Some(workspace_root.to_string());
+        workspace_data.settings.managed_directory = Some(
+            workspace_papers_dir(Path::new(workspace_root))
+                .to_string_lossy()
+                .into_owned(),
+        );
+        return Ok(Some(workspace_data));
     }
 
-    let workspace_json = fs::read_to_string(&workspace_file).map_err(|error| error.to_string())?;
-    let mut workspace_data: AppData =
-        serde_json::from_str(&workspace_json).map_err(|error| error.to_string())?;
-    workspace_data.settings.workspace_root = Some(workspace_root.to_string());
-    workspace_data.settings.managed_directory = Some(
-        workspace_papers_dir(Path::new(workspace_root))
-            .to_string_lossy()
-            .into_owned(),
-    );
-    Ok(Some(workspace_data))
+    if let Some(root) = local_data
+        .settings
+        .managed_directory
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+    {
+        if managed_library_data_file(&root).exists() {
+            return Ok(Some(read_managed_library(&root)?));
+        }
+    }
+
+    Ok(Some(local_data))
 }
 
 fn add_category_with_ancestors(categories: &mut BTreeSet<String>, value: &str) {
@@ -208,7 +252,7 @@ fn collect_directory_categories(
         if path
             .file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(|name| name == "notes")
+            .is_some_and(|name| name == "notes" || name == ".legra")
         {
             continue;
         }
