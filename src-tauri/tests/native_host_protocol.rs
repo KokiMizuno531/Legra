@@ -60,6 +60,30 @@ fn native_host_uses_chrome_length_framing() {
         .get("categories")
         .and_then(|value| value.as_array())
         .is_some_and(|values| values.is_empty()));
+    assert_eq!(
+        response
+            .get("host_version")
+            .and_then(|value| value.as_str()),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
+    assert_eq!(
+        response
+            .get("category_count")
+            .and_then(|value| value.as_u64()),
+        Some(0)
+    );
+    assert_eq!(
+        response
+            .get("category_source")
+            .and_then(|value| value.as_str()),
+        Some("local_data")
+    );
+    assert_eq!(
+        response
+            .get("managed_directory")
+            .and_then(|value| value.as_str()),
+        None
+    );
 
     let _ = fs::remove_dir_all(setting_dir);
 }
@@ -121,6 +145,24 @@ fn native_host_lists_managed_library_directory_categories() {
     assert_eq!(
         categories,
         vec!["AI", "AI/Vision", "Systems", "Theory", "Theory/Graphs"]
+    );
+    assert_eq!(
+        response
+            .get("category_count")
+            .and_then(|value| value.as_u64()),
+        Some(5)
+    );
+    assert_eq!(
+        response
+            .get("category_source")
+            .and_then(|value| value.as_str()),
+        Some("managed_library")
+    );
+    assert_eq!(
+        response
+            .get("managed_directory")
+            .and_then(|value| value.as_str()),
+        Some(managed_path.as_ref())
     );
 
     let _ = fs::remove_dir_all(setting_dir);

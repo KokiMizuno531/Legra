@@ -1594,7 +1594,9 @@ function App() {
                 </dl>
               ) : (
                 <p className="settings-help">
-                  Install the Native Host manifest after loading the Chrome extension.
+                  Install the Native Host after loading the Chrome extension. After updating Legra,
+                  start the app and click Install Native Host again if Chrome still uses an older
+                  host.
                 </p>
               )}
             </div>

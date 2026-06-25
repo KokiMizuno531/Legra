@@ -38,6 +38,8 @@ Install the Native Messaging manifest from Legra:
 
 This copies the Native Host to Legra's user data directory and registers it for Google Chrome and Chromium. Windows uses the current user's registry; macOS and Linux use each browser's user-specific manifest directory.
 
+After updating Legra, start the updated app and click `Install Native Host` again if Chrome still shows old import or category behavior. Reloading the unpacked extension only refreshes extension files; it does not replace the Native Host binary or the manifest path Chrome uses.
+
 ## Development Setup
 
 If you are developing Legra from this repository instead of using Homebrew, build the native host first:
@@ -91,10 +93,11 @@ Legra polls the import inbox automatically. You can also click `More -> Import i
 
 ## Troubleshooting
 
-- Reload the extension after changing `service_worker.js`, `popup.js`, or the manifest.
+- Reload the extension after changing `service_worker.js`, `popup.js`, or the extension manifest.
 - If Legra was installed through Homebrew, open Settings and click `Install Native Host` again after changing the Chrome extension ID.
+- If Legra was updated through Homebrew, open the updated Legra app and click `Install Native Host` again so Chrome launches the current Native Host.
 - If Legra is running from the development repository, rebuild `paper_manager_native_host` after Rust changes.
-- If existing categories do not appear, rebuild `paper_manager_native_host`, reload the extension, and open the popup again.
+- If existing categories do not appear, rebuild or reinstall `paper_manager_native_host`, reload the extension, and open the popup again. The popup reports whether the Native Host returned zero categories or appears too old to provide diagnostics.
 - Confirm the Native Messaging host path exists. On macOS and Linux it must be absolute.
 - Confirm `allowed_origins` matches the Chrome extension ID.
 - If PDF download is unavailable, Legra should still queue a metadata-only import.

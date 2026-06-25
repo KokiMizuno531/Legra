@@ -79,6 +79,8 @@ sudo apt install ./Legra_<version>_linux_amd64.deb
 
 The Chrome extension is not distributed through Homebrew yet. To use Chrome import, load `chrome-extension/` as an unpacked Chrome extension, copy its extension ID, paste it into `Settings -> Chrome extension ID`, and click `Install Native Host`.
 
+After updating Legra through Homebrew, start Legra and click `Settings -> Install Native Host` again if Chrome import or category loading still appears stale. Reloading the unpacked Chrome extension only reloads extension JavaScript; it does not update the Native Host binary or manifest that Chrome launches.
+
 ## Development
 
 Install dependencies:
@@ -148,7 +150,7 @@ cd src-tauri
 cargo build --bin paper_manager_native_host
 ```
 
-For packaged releases, the same Settings action is intended to install or refresh the Native Messaging manifest after Legra is installed.
+For packaged releases, the same Settings action is intended to install or refresh the Native Messaging manifest after Legra is installed. If Legra was updated through Homebrew or another installer, launch the updated app before reinstalling the Native Host so the copied host binary matches the installed Legra version.
 
 ## Shared Workspaces
 
@@ -181,7 +183,7 @@ brew install --cask legra
 
 A copy of the cask is also kept in [Packaging/homebrew](Packaging/homebrew) for reference.
 
-After installing on any supported operating system, open Legra, set the Chrome extension ID in Settings, and click `Install Native Host` to enable Chrome or Chromium import.
+After installing on any supported operating system, open Legra, set the Chrome extension ID in Settings, and click `Install Native Host` to enable Chrome or Chromium import. If Chrome still reports old category behavior after an app update, reinstall the Native Host from Settings; reloading the Chrome extension alone does not refresh the Native Host binary.
 
 ## Repository Safety
 

@@ -12,6 +12,7 @@ use std::{
 mod platform;
 
 const MANAGED_LIBRARY_SCHEMA_VERSION: u32 = 1;
+const HOST_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Deserialize)]
 struct Paper {
@@ -66,6 +67,15 @@ struct NativeResponse {
     message: String,
     request_path: Option<String>,
     categories: Option<Vec<String>>,
+    host_version: Option<String>,
+    category_count: Option<usize>,
+    managed_directory: Option<String>,
+    category_source: Option<String>,
+}
+
+struct CategoryData {
+    data: AppData,
+    source: &'static str,
 }
 
 fn app_root_dir() -> Result<PathBuf, String> {
@@ -170,7 +180,7 @@ fn read_managed_library(root: &Path) -> Result<AppData, String> {
     Ok(data)
 }
 
-fn read_app_data() -> Result<Option<AppData>, String> {
+fn read_category_data() -> Result<Option<CategoryData>, String> {
     let data_file = data_file_path()?;
     if !data_file.exists() {
         return Ok(None);
@@ -188,7 +198,10 @@ fn read_app_data() -> Result<Option<AppData>, String> {
     if let Some(workspace_root) = workspace_root {
         let workspace_file = workspace_data_file(Path::new(workspace_root));
         if !workspace_file.exists() {
-            return Ok(Some(local_data));
+            return Ok(Some(CategoryData {
+                data: local_data,
+                source: "local_data",
+            }));
         }
 
         let workspace_json =
@@ -201,7 +214,10 @@ fn read_app_data() -> Result<Option<AppData>, String> {
                 .to_string_lossy()
                 .into_owned(),
         );
-        return Ok(Some(workspace_data));
+        return Ok(Some(CategoryData {
+            data: workspace_data,
+            source: "workspace",
+        }));
     }
 
     if let Some(root) = local_data
@@ -213,11 +229,17 @@ fn read_app_data() -> Result<Option<AppData>, String> {
         .map(PathBuf::from)
     {
         if managed_library_data_file(&root).exists() {
-            return Ok(Some(read_managed_library(&root)?));
+            return Ok(Some(CategoryData {
+                data: read_managed_library(&root)?,
+                source: "managed_library",
+            }));
         }
     }
 
-    Ok(Some(local_data))
+    Ok(Some(CategoryData {
+        data: local_data,
+        source: "local_data",
+    }))
 }
 
 fn add_category_with_ancestors(categories: &mut BTreeSet<String>, value: &str) {
@@ -271,11 +293,21 @@ fn collect_directory_categories(
     Ok(())
 }
 
-fn list_categories() -> Result<Vec<String>, String> {
-    let Some(data) = read_app_data()? else {
-        return Ok(Vec::new());
+fn list_category_diagnostics() -> Result<NativeResponse, String> {
+    let Some(category_data) = read_category_data()? else {
+        return Ok(NativeResponse {
+            ok: true,
+            message: "Loaded Legra categories.".to_string(),
+            request_path: None,
+            categories: Some(Vec::new()),
+            host_version: Some(HOST_VERSION.to_string()),
+            category_count: Some(0),
+            managed_directory: None,
+            category_source: Some("none".to_string()),
+        });
     };
 
+    let data = category_data.data;
     let mut categories = BTreeSet::new();
     for paper in &data.papers {
         if let Some(category) = paper.folder_category.as_deref() {
@@ -299,11 +331,25 @@ fn list_categories() -> Result<Vec<String>, String> {
                 .map(PathBuf::from)
         });
 
+    let managed_directory = category_root
+        .as_ref()
+        .map(|root| root.to_string_lossy().into_owned());
+
     if let Some(root) = category_root {
         collect_directory_categories(&mut categories, &root, &root)?;
     }
 
-    Ok(categories.into_iter().collect())
+    let categories = categories.into_iter().collect::<Vec<_>>();
+    Ok(NativeResponse {
+        ok: true,
+        message: "Loaded Legra categories.".to_string(),
+        request_path: None,
+        category_count: Some(categories.len()),
+        categories: Some(categories),
+        host_version: Some(HOST_VERSION.to_string()),
+        managed_directory,
+        category_source: Some(category_data.source.to_string()),
+    })
 }
 
 fn read_native_message() -> Result<NativeMessage, String> {
@@ -334,12 +380,7 @@ fn run() -> Result<NativeResponse, String> {
     let message = read_native_message()?;
 
     if message.action == "list_categories" {
-        return Ok(NativeResponse {
-            ok: true,
-            message: "Loaded Legra categories.".to_string(),
-            request_path: None,
-            categories: Some(list_categories()?),
-        });
+        return list_category_diagnostics();
     }
 
     if message.action == "import_paper" {
@@ -352,6 +393,10 @@ fn run() -> Result<NativeResponse, String> {
             message: "Import request queued for Legra.".to_string(),
             request_path: Some(path.to_string_lossy().into_owned()),
             categories: None,
+            host_version: None,
+            category_count: None,
+            managed_directory: None,
+            category_source: None,
         });
     }
 
@@ -366,6 +411,10 @@ fn main() {
             message: error,
             request_path: None,
             categories: None,
+            host_version: None,
+            category_count: None,
+            managed_directory: None,
+            category_source: None,
         },
     };
 
