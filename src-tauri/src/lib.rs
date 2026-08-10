@@ -217,6 +217,13 @@ struct ExtensionImportSummary {
 }
 
 #[derive(Debug, Serialize)]
+struct MetadataBackfillSummary {
+    updated: usize,
+    failed: usize,
+    messages: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
 struct PaperMetadata {
     title: Option<String>,
     authors: Vec<String>,
@@ -1609,6 +1616,105 @@ fn crossref_authors(message: &serde_json::Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn parse_crossref_metadata(
+    json: &serde_json::Value,
+    requested_doi: &str,
+) -> Result<PaperMetadata, String> {
+    let message = json
+        .get("message")
+        .ok_or_else(|| "Crossref response did not contain metadata.".to_string())?;
+    let (year, month) = crossref_year_and_month(message);
+
+    Ok(PaperMetadata {
+        title: first_json_string(message, "title"),
+        authors: crossref_authors(message),
+        year,
+        publication: first_json_string(message, "container-title"),
+        volume: first_json_string(message, "volume"),
+        issue: first_json_string(message, "issue"),
+        pages: first_json_string(message, "page")
+            .or_else(|| first_json_string(message, "article-number")),
+        numpages: None,
+        month,
+        publisher: first_json_string(message, "publisher"),
+        doi: first_json_string(message, "DOI").or_else(|| Some(requested_doi.to_string())),
+        arxiv_id: None,
+        url: first_json_string(message, "URL"),
+        abstract_text: first_json_string(message, "abstract"),
+    })
+}
+
+fn aps_date_parts(value: Option<&str>) -> (Option<u16>, Option<String>) {
+    let mut parts = value.unwrap_or_default().split('-');
+    let year = parts.next().and_then(|part| part.parse::<u16>().ok());
+    let month = parts
+        .next()
+        .and_then(|part| part.parse::<u64>().ok())
+        .and_then(month_name);
+    (year, month)
+}
+
+fn nested_json_string(value: &serde_json::Value, path: &[&str]) -> Option<String> {
+    path.iter()
+        .try_fold(value, |current, key| current.get(*key))
+        .and_then(serde_json::Value::as_str)
+        .map(clean_text)
+        .filter(|inner| !inner.is_empty())
+}
+
+fn parse_aps_metadata(
+    json: &serde_json::Value,
+    requested_doi: &str,
+) -> Result<PaperMetadata, String> {
+    let data = json
+        .get("data")
+        .ok_or_else(|| "APS response did not contain metadata.".to_string())?;
+    let doi = nested_json_string(data, &["identifiers", "doi"])
+        .or_else(|| first_json_string(data, "id"))
+        .unwrap_or_else(|| requested_doi.to_string());
+    let authors = data
+        .get("authors")
+        .and_then(serde_json::Value::as_array)
+        .map(|authors| {
+            authors
+                .iter()
+                .filter_map(|author| first_json_string(author, "name"))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let (year, month) = aps_date_parts(data.get("date").and_then(serde_json::Value::as_str));
+    let first_page = first_json_string(data, "pageStart");
+    let last_page = first_json_string(data, "pageEnd");
+    let pages = match (first_page, last_page) {
+        (Some(first), Some(last)) if first != last => Some(format!("{first}-{last}")),
+        (Some(first), _) => Some(first),
+        (None, Some(last)) => Some(last),
+        (None, None) => None,
+    };
+    let numpages = data
+        .get("numPages")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u16::try_from(value).ok());
+
+    Ok(PaperMetadata {
+        title: nested_json_string(data, &["title", "value"]),
+        authors,
+        year,
+        publication: nested_json_string(data, &["journal", "abbreviatedName"])
+            .or_else(|| nested_json_string(data, &["journal", "name"])),
+        volume: nested_json_string(data, &["volume", "number"]),
+        issue: nested_json_string(data, &["issue", "number"]),
+        pages,
+        numpages,
+        month,
+        publisher: Some("American Physical Society".to_string()),
+        doi: Some(doi.clone()),
+        arxiv_id: None,
+        url: Some(format!("https://link.aps.org/doi/{doi}")),
+        abstract_text: nested_json_string(data, &["abstract", "value"]),
+    })
+}
+
 fn fetch_crossref_metadata(doi: &str) -> Result<PaperMetadata, String> {
     let doi = doi.trim();
     if doi.is_empty() {
@@ -1635,27 +1741,54 @@ fn fetch_crossref_metadata(doi: &str) -> Result<PaperMetadata, String> {
     let json = response
         .json::<serde_json::Value>()
         .map_err(|error| format!("Could not parse DOI metadata: {error}"))?;
-    let message = json
-        .get("message")
-        .ok_or_else(|| "Crossref response did not contain metadata.".to_string())?;
-    let (year, month) = crossref_year_and_month(message);
+    parse_crossref_metadata(&json, doi)
+}
 
-    Ok(PaperMetadata {
-        title: first_json_string(message, "title"),
-        authors: crossref_authors(message),
-        year,
-        publication: first_json_string(message, "container-title"),
-        volume: first_json_string(message, "volume"),
-        issue: first_json_string(message, "issue"),
-        pages: first_json_string(message, "page"),
-        numpages: None,
-        month,
-        publisher: first_json_string(message, "publisher"),
-        doi: first_json_string(message, "DOI").or_else(|| Some(doi.to_string())),
-        arxiv_id: None,
-        url: first_json_string(message, "URL"),
-        abstract_text: first_json_string(message, "abstract"),
-    })
+fn is_aps_doi(doi: &str) -> bool {
+    normalize_doi(doi)
+        .to_ascii_lowercase()
+        .starts_with("10.1103/")
+}
+
+fn fetch_aps_metadata(doi: &str) -> Result<PaperMetadata, String> {
+    let doi = normalize_doi(doi);
+    if doi.is_empty() {
+        return Err("DOI is required.".to_string());
+    }
+
+    let path_doi = urlencoding::encode(&doi).replace("%2F", "/");
+    let url = format!("https://harvest.aps.org/v2/journals/articles/{path_doi}");
+    let response = metadata_http_client()?
+        .get(url)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .send()
+        .map_err(|error| format!("Could not fetch APS metadata: {error}"))?;
+
+    if !response.status().is_success() {
+        return Err(format!(
+            "Could not fetch APS metadata. HTTP status: {}.",
+            response.status()
+        ));
+    }
+
+    let json = response
+        .json::<serde_json::Value>()
+        .map_err(|error| format!("Could not parse APS metadata: {error}"))?;
+    parse_aps_metadata(&json, &doi)
+}
+
+fn fetch_doi_metadata(doi: &str) -> Result<PaperMetadata, String> {
+    let doi = normalize_doi(doi);
+    if !is_aps_doi(&doi) {
+        return fetch_crossref_metadata(&doi);
+    }
+
+    match fetch_aps_metadata(&doi) {
+        Ok(metadata) => Ok(metadata),
+        Err(aps_error) => fetch_crossref_metadata(&doi).map_err(|crossref_error| {
+            format!("{aps_error} Crossref fallback also failed: {crossref_error}")
+        }),
+    }
 }
 
 fn crossref_pdf_url_for_doi(doi: &str) -> Result<Option<String>, String> {
@@ -2518,6 +2651,20 @@ fn normalize_journal_key(value: &str) -> String {
         .join(" ")
 }
 
+fn sanitize_bibtex_key(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | ':') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    sanitized.trim_matches('_').to_string()
+}
+
 fn normalize_journal_for_bibtex(publication: Option<&str>, settings: &Settings) -> Option<String> {
     let publication = publication?.trim();
     if publication.is_empty() {
@@ -2562,13 +2709,13 @@ fn bibtex_key(paper: &Paper, settings: &Settings) -> String {
     if let Some(key) = paper.bibtex_key.as_deref() {
         let trimmed = key.trim();
         if !trimmed.is_empty() {
-            return sanitize_filename(trimmed);
+            return sanitize_bibtex_key(trimmed);
         }
     }
 
     let rule = settings.bibtex_key_rule.trim();
     if !rule.is_empty() {
-        let rendered = sanitize_filename(&render_paper_template(rule, paper));
+        let rendered = sanitize_bibtex_key(&render_paper_template(rule, paper));
         if !rendered.is_empty() {
             return rendered;
         }
@@ -2576,7 +2723,7 @@ fn bibtex_key(paper: &Paper, settings: &Settings) -> String {
 
     if let Some(doi) = paper.doi.as_deref() {
         let doi_key = doi_suffix(Some(doi))
-            .map(|suffix| sanitize_filename(&suffix))
+            .map(|suffix| sanitize_bibtex_key(&suffix))
             .filter(|key| !key.is_empty());
         if let Some(key) = doi_key {
             return key;
@@ -2593,7 +2740,7 @@ fn bibtex_key(paper: &Paper, settings: &Settings) -> String {
             .year
             .map(|year| year.to_string())
             .unwrap_or_else(|| "unknown".to_string());
-        return sanitize_filename(&format!("{first_author}-{year}"));
+        return sanitize_bibtex_key(&format!("{first_author}-{year}"));
     }
 
     let first_author = paper
@@ -2605,7 +2752,7 @@ fn bibtex_key(paper: &Paper, settings: &Settings) -> String {
         .year
         .map(|year| year.to_string())
         .unwrap_or_else(|| "unknown".to_string());
-    sanitize_filename(&format!("{first_author}{year}"))
+    sanitize_bibtex_key(&format!("{first_author}{year}"))
 }
 
 fn push_bibtex_field(fields: &mut Vec<String>, name: &str, value: Option<&str>) {
@@ -2848,7 +2995,7 @@ fn metadata_for_discovered_pdf(path: &Path) -> Result<PaperMetadata, String> {
     let (doi, arxiv_id) = detected_pdf_identifier(path)?;
     if let Some(doi) = doi {
         if !doi.to_ascii_lowercase().starts_with("10.48550/arxiv.") {
-            return fetch_crossref_metadata(&doi);
+            return fetch_doi_metadata(&doi);
         }
     }
     if let Some(arxiv_id) = arxiv_id {
@@ -3457,7 +3604,7 @@ fn metadata_for_import_request(
 
     if let Some(doi) = request.doi.as_deref().map(normalize_doi) {
         if !doi.is_empty() {
-            match fetch_crossref_metadata(&doi) {
+            match fetch_doi_metadata(&doi) {
                 Ok(metadata) => return Ok(Some(metadata)),
                 Err(error) => {
                     if arxiv_id.is_some() {
@@ -3537,6 +3684,53 @@ fn merge_paper_metadata(primary: PaperMetadata, fallback: PaperMetadata) -> Pape
         arxiv_id: primary.arxiv_id.or(fallback.arxiv_id),
         url: primary.url.or(fallback.url),
         abstract_text: primary.abstract_text.or(fallback.abstract_text),
+    }
+}
+
+fn fill_missing_paper_metadata(paper: &mut Paper, metadata: PaperMetadata) -> bool {
+    let mut changed = false;
+    if paper.title.trim().is_empty() {
+        if let Some(title) = metadata.title {
+            paper.title = title;
+            changed = true;
+        }
+    }
+    if paper.authors.is_empty() && !metadata.authors.is_empty() {
+        paper.authors = metadata.authors;
+        changed = true;
+    }
+    changed |= fill_missing_option(&mut paper.year, metadata.year);
+    changed |= fill_missing_string_option(&mut paper.publication, metadata.publication);
+    changed |= fill_missing_string_option(&mut paper.volume, metadata.volume);
+    changed |= fill_missing_string_option(&mut paper.issue, metadata.issue);
+    changed |= fill_missing_string_option(&mut paper.pages, metadata.pages);
+    changed |= fill_missing_option(&mut paper.numpages, metadata.numpages);
+    changed |= fill_missing_string_option(&mut paper.month, metadata.month);
+    changed |= fill_missing_string_option(&mut paper.publisher, metadata.publisher);
+    changed |= fill_missing_string_option(&mut paper.doi, metadata.doi);
+    changed |= fill_missing_string_option(&mut paper.url, metadata.url);
+    changed |= fill_missing_string_option(&mut paper.abstract_text, metadata.abstract_text);
+    changed
+}
+
+fn fill_missing_option<T>(target: &mut Option<T>, source: Option<T>) -> bool {
+    if target.is_none() && source.is_some() {
+        *target = source;
+        true
+    } else {
+        false
+    }
+}
+
+fn fill_missing_string_option(target: &mut Option<String>, source: Option<String>) -> bool {
+    let target_missing = target
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty());
+    if target_missing && source.is_some() {
+        *target = source;
+        true
+    } else {
+        false
     }
 }
 
@@ -3823,12 +4017,87 @@ fn load_app_data() -> Result<AppData, String> {
 }
 
 #[tauri::command]
+fn backfill_aps_metadata() -> Result<MetadataBackfillSummary, String> {
+    let mut data = load_or_default_app_data()?;
+    let candidates = data
+        .papers
+        .iter()
+        .enumerate()
+        .filter_map(|(index, paper)| {
+            let doi = paper.doi.as_deref()?;
+            let pages_missing = paper
+                .pages
+                .as_deref()
+                .is_none_or(|pages| pages.trim().is_empty());
+            (is_aps_doi(doi) && pages_missing).then(|| (index, normalize_doi(doi)))
+        })
+        .collect::<Vec<_>>();
+    let mut updated = 0;
+    let mut failed = 0;
+    let mut messages = Vec::new();
+
+    for chunk in candidates.chunks(4) {
+        let results = std::thread::scope(|scope| {
+            let handles = chunk
+                .iter()
+                .map(|(index, doi)| {
+                    let index = *index;
+                    let doi = doi.clone();
+                    scope.spawn(move || {
+                        let result = fetch_doi_metadata(&doi);
+                        (index, doi, result)
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .map_err(|_| "APS metadata worker panicked.".to_string())
+                })
+                .collect::<Result<Vec<_>, String>>()
+        })?;
+
+        for (index, doi, result) in results {
+            match result {
+                Ok(metadata) if metadata.pages.is_some() => {
+                    let paper = &mut data.papers[index];
+                    if fill_missing_paper_metadata(paper, metadata) {
+                        paper.updated_at = current_timestamp()?;
+                        updated += 1;
+                    }
+                }
+                Ok(_) => {
+                    failed += 1;
+                    messages.push(format!("APS metadata for {doi} did not contain pages."));
+                }
+                Err(error) => {
+                    failed += 1;
+                    messages.push(format!("Could not backfill {doi}: {error}"));
+                }
+            }
+        }
+    }
+
+    if updated > 0 {
+        save_data_file(&data)?;
+    }
+
+    Ok(MetadataBackfillSummary {
+        updated,
+        failed,
+        messages,
+    })
+}
+
+#[tauri::command]
 fn fetch_paper_metadata(input: FetchMetadataInput) -> Result<PaperMetadata, String> {
     let doi = normalize_optional(input.doi);
     let arxiv_id = normalize_optional(input.arxiv_id);
 
     if let Some(doi) = doi.as_deref() {
-        return fetch_crossref_metadata(doi);
+        return fetch_doi_metadata(doi);
     }
 
     if let Some(arxiv_id) = arxiv_id.as_deref() {
@@ -3845,7 +4114,7 @@ fn resolve_paper_import(input: ResolvePaperImportInput) -> Result<PaperImportRes
     let mut downloaded_pdf_path = None;
 
     let metadata = if let Some(doi) = doi.as_deref() {
-        let metadata = fetch_crossref_metadata(doi)?;
+        let metadata = fetch_doi_metadata(doi)?;
         match download_crossref_pdf(doi) {
             Ok(Some(path)) => {
                 downloaded_pdf_path = Some(path.to_string_lossy().into_owned());
@@ -5203,6 +5472,131 @@ mod tests {
     }
 
     #[test]
+    fn crossref_article_number_fills_missing_pages() {
+        let json = serde_json::json!({
+            "message": {
+                "title": ["Article-number paper"],
+                "author": [{"given": "Ada", "family": "Lovelace"}],
+                "container-title": ["Physical Review X"],
+                "volume": "12",
+                "issue": "4",
+                "article-number": "040501",
+                "published": {"date-parts": [[2022, 12, 8]]},
+                "publisher": "American Physical Society (APS)",
+                "DOI": "10.1103/physrevx.12.040501",
+                "URL": "https://doi.org/10.1103/physrevx.12.040501"
+            }
+        });
+
+        let metadata = parse_crossref_metadata(&json, "10.1103/PhysRevX.12.040501").unwrap();
+
+        assert_eq!(metadata.pages.as_deref(), Some("040501"));
+        assert_eq!(metadata.month.as_deref(), Some("Dec"));
+    }
+
+    #[test]
+    fn aps_metadata_produces_complete_physical_review_bibtex_fields() {
+        let json = serde_json::json!({
+            "data": {
+                "abstract": {"value": "<p>A useful result.</p>"},
+                "authors": [
+                    {"name": "Libor Šmejkal"},
+                    {"name": "Jairo Sinova"},
+                    {"name": "Tomas Jungwirth"}
+                ],
+                "date": "2022-12-08",
+                "id": "10.1103/PhysRevX.12.040501",
+                "identifiers": {"doi": "10.1103/PhysRevX.12.040501"},
+                "issue": {"number": "4"},
+                "pageStart": "040501",
+                "hasArticleId": true,
+                "numPages": 27,
+                "journal": {
+                    "abbreviatedName": "Phys. Rev. X",
+                    "name": "Physical Review X"
+                },
+                "title": {"value": "Emerging Research Landscape of Altermagnetism"},
+                "volume": {"number": "12"}
+            }
+        });
+        let metadata = parse_aps_metadata(&json, "10.1103/PhysRevX.12.040501").unwrap();
+
+        assert_eq!(metadata.publication.as_deref(), Some("Phys. Rev. X"));
+        assert_eq!(metadata.pages.as_deref(), Some("040501"));
+        assert_eq!(metadata.numpages, Some(27));
+        assert_eq!(metadata.month.as_deref(), Some("Dec"));
+        assert_eq!(
+            metadata.publisher.as_deref(),
+            Some("American Physical Society")
+        );
+        assert_eq!(
+            metadata.url.as_deref(),
+            Some("https://link.aps.org/doi/10.1103/PhysRevX.12.040501")
+        );
+
+        let mut paper = test_paper(metadata.doi.as_deref(), None);
+        paper.title = metadata.title.unwrap();
+        paper.authors = metadata.authors;
+        paper.year = metadata.year;
+        paper.publication = metadata.publication;
+        paper.volume = metadata.volume;
+        paper.issue = metadata.issue;
+        paper.pages = metadata.pages;
+        paper.numpages = metadata.numpages;
+        paper.month = metadata.month;
+        paper.publisher = metadata.publisher;
+        paper.url = metadata.url;
+        let bibtex = paper_to_bibtex(&paper, &test_settings());
+
+        assert!(bibtex.starts_with("@article{PhysRevX.12.040501,"));
+        for field in [
+            "journal = {Phys. Rev. X}",
+            "volume = {12}",
+            "issue = {4}",
+            "pages = {040501}",
+            "numpages = {27}",
+            "month = {Dec}",
+            "publisher = {American Physical Society}",
+            "doi = {10.1103/PhysRevX.12.040501}",
+            "url = {https://link.aps.org/doi/10.1103/PhysRevX.12.040501}",
+        ] {
+            assert!(bibtex.contains(field), "missing BibTeX field: {field}");
+        }
+    }
+
+    #[test]
+    fn aps_backfill_only_fills_missing_fields() {
+        let mut paper = test_paper(Some("10.1103/PhysRevX.12.040501"), None);
+        paper.publication = Some("User journal name".to_string());
+        paper.publisher = Some("User publisher".to_string());
+        paper.pages = Some(" ".to_string());
+        let metadata = PaperMetadata {
+            title: Some("Replacement title".to_string()),
+            authors: vec!["Replacement Author".to_string()],
+            year: Some(2022),
+            publication: Some("Phys. Rev. X".to_string()),
+            volume: Some("12".to_string()),
+            issue: Some("4".to_string()),
+            pages: Some("040501".to_string()),
+            numpages: Some(27),
+            month: Some("Dec".to_string()),
+            publisher: Some("American Physical Society".to_string()),
+            doi: Some("10.1103/PhysRevX.12.040501".to_string()),
+            arxiv_id: None,
+            url: Some("https://link.aps.org/doi/10.1103/PhysRevX.12.040501".to_string()),
+            abstract_text: Some("Abstract".to_string()),
+        };
+
+        assert!(fill_missing_paper_metadata(&mut paper, metadata));
+        assert_eq!(paper.title, "A test paper");
+        assert_eq!(paper.authors, vec!["Ada Lovelace"]);
+        assert_eq!(paper.publication.as_deref(), Some("User journal name"));
+        assert_eq!(paper.publisher.as_deref(), Some("User publisher"));
+        assert_eq!(paper.pages.as_deref(), Some("040501"));
+        assert_eq!(paper.numpages, Some(27));
+    }
+
+    #[test]
     fn managed_library_storage_uses_relative_paths_and_excludes_local_settings() {
         let root = temp_test_dir("managed-storage");
         let pdf = root.join("category").join("paper.pdf");
@@ -5537,6 +5931,7 @@ pub fn run() {
             get_platform_info,
             save_app_data,
             load_app_data,
+            backfill_aps_metadata,
             fetch_paper_metadata,
             resolve_paper_import,
             process_extension_imports,

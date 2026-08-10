@@ -140,6 +140,12 @@ type ExtensionImportSummary = {
   messages: string[];
 };
 
+type MetadataBackfillSummary = {
+  updated: number;
+  failed: number;
+  messages: string[];
+};
+
 type WorkspaceHealth = {
   ok: boolean;
   warnings: string[];
@@ -444,6 +450,7 @@ function App() {
   const [importSource, setImportSource] = useState("");
   const [metadataLoading, setMetadataLoading] = useState(false);
   const [librarySyncing, setLibrarySyncing] = useState(false);
+  const [startupComplete, setStartupComplete] = useState(false);
   const [message, setMessage] = useState("Loading saved papers...");
   const [error, setError] = useState<string | null>(null);
 
@@ -611,6 +618,19 @@ function App() {
       }
     } finally {
       importProcessingRef.current = false;
+    }
+  }
+
+  async function backfillApsMetadata() {
+    const summary = await invoke<MetadataBackfillSummary>("backfill_aps_metadata");
+    if (summary.updated > 0) {
+      await loadSavedData();
+      setMessage(`Updated metadata for ${summary.updated} APS paper${summary.updated === 1 ? "" : "s"}.`);
+    }
+    if (summary.failed > 0) {
+      setError(
+        `Could not update ${summary.failed} APS paper${summary.failed === 1 ? "" : "s"}. ${summary.messages.slice(0, 3).join(" ")}`,
+      );
     }
   }
 
@@ -1338,26 +1358,26 @@ function App() {
 
   useEffect(() => {
     loadSavedData()
-      .then((nextData) => {
+      .then(async (nextData) => {
         if (!isRegisterWindow && !isEditWindow && !isSettingsWindow) {
-          return syncManagedLibrary({ silent: true }, nextData);
+          await syncManagedLibrary({ silent: true }, nextData);
+          await processExtensionImports({ silent: true });
+          await backfillApsMetadata();
         }
       })
       .catch((reason) => {
         setError(String(reason));
         setMessage("Failed to load saved data.");
+      })
+      .finally(() => {
+        setStartupComplete(true);
       });
   }, []);
 
   useEffect(() => {
-    if (isRegisterWindow || isEditWindow || isSettingsWindow) {
+    if (!startupComplete || isRegisterWindow || isEditWindow || isSettingsWindow) {
       return;
     }
-
-    processExtensionImports({ silent: true }).catch((reason) => {
-      setError(String(reason));
-      setMessage("Failed to process Chrome extension imports.");
-    });
 
     const interval = window.setInterval(() => {
       processExtensionImports({ silent: true }).catch(() => {});
@@ -1366,7 +1386,7 @@ function App() {
     return () => {
       window.clearInterval(interval);
     };
-  }, [isEditWindow, isRegisterWindow, isSettingsWindow]);
+  }, [isEditWindow, isRegisterWindow, isSettingsWindow, startupComplete]);
 
   useEffect(() => {
     if (isRegisterWindow || isEditWindow || isSettingsWindow) {
