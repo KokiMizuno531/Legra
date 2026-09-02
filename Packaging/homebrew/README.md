@@ -1,20 +1,28 @@
-# Homebrew Cask
+# Homebrew Cask maintenance
 
-This directory contains the starter cask for a personal Homebrew tap.
+The public tap is [KokiMizuno531/homebrew-legra](https://github.com/KokiMizuno531/homebrew-legra).
+This directory keeps the matching cask in the main repository as a release reference.
 
-Recommended first release flow:
+Release flow:
 
-1. Create a GitHub release tag, for example `v0.1.0`.
-2. Let the `Release` workflow build the macOS artifact.
-3. Download `SHA256SUMS.txt` from the draft release.
-4. Copy `Packaging/homebrew/Casks/legra.rb` into a tap repository such as `homebrew-legra`.
-5. Replace `OWNER`, asset filename, `version`, and `sha256`.
-6. Test locally:
+1. Bump every product version and push the release commit to `main`.
+2. Wait for the main CI workflow to pass.
+3. Push an annotated tag matching the product version, for example `v0.3.0`.
+4. Wait for the `Release` workflow to publish all platform assets and `SHA256SUMS.txt`.
+5. Read the checksum for `Legra_<version>_aarch64.app.zip` from the published checksums.
+6. Update `version` and `sha256` in both `Packaging/homebrew/Casks/legra.rb` and the public tap's
+   `Casks/legra.rb`.
+7. Commit and push the main-repository reference cask and the public tap cask.
+8. Test the published upgrade:
 
 ```sh
-brew tap OWNER/legra
-brew install --cask legra
-brew uninstall --cask legra
+brew update
+brew info --cask legra
+brew upgrade --cask legra
+open -a Legra
 ```
 
-For Chrome import, start Legra after installation or upgrade, open Settings, paste the Chrome extension ID, and click `Install Native Host`. Reloading the Chrome extension does not refresh the Native Host binary.
+The GitHub Release alone does not update Homebrew users; the tap commit is required. Do not update
+the cask before the matching asset exists. After an upgrade, opening Legra refreshes any previously
+installed Chrome Native Host or MCP connector when its recorded version is stale. First-time users
+must still install each connector from Settings.

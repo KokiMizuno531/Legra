@@ -22,6 +22,12 @@ pub const NATIVE_HOST_BINARY_NAME: &str = if cfg!(target_os = "windows") {
     "paper_manager_native_host"
 };
 
+pub const MCP_SERVER_BINARY_NAME: &str = if cfg!(target_os = "windows") {
+    "legra_mcp.exe"
+} else {
+    "legra_mcp"
+};
+
 fn nonempty_env_path(name: &str) -> Option<PathBuf> {
     env::var_os(name)
         .filter(|value| !value.is_empty())
@@ -65,6 +71,37 @@ pub fn default_setting_dir() -> Result<PathBuf, String> {
     Ok(home_dir()?.join(".legra"))
 }
 
+fn select_setting_dir(
+    explicit_override: Option<PathBuf>,
+    default_dir: PathBuf,
+    legacy_dir: PathBuf,
+) -> PathBuf {
+    if let Some(path) = explicit_override {
+        return path;
+    }
+
+    let default_data = default_dir.join("app-data.json");
+    let legacy_data = legacy_dir.join("app-data.json");
+    if legacy_data.exists() && !default_data.exists() {
+        legacy_dir
+    } else {
+        default_dir
+    }
+}
+
+pub fn setting_dir_with_legacy(legacy_dir: PathBuf) -> Result<PathBuf, String> {
+    let explicit_override = nonempty_env_path("LEGRA_SETTING_DIR");
+    let default_dir = match explicit_override.as_ref() {
+        Some(path) => path.clone(),
+        None => default_setting_dir()?,
+    };
+    Ok(select_setting_dir(
+        explicit_override,
+        default_dir,
+        legacy_dir,
+    ))
+}
+
 pub fn user_config_dir() -> Result<PathBuf, String> {
     #[cfg(target_os = "macos")]
     {
@@ -89,4 +126,22 @@ pub fn user_config_dir() -> Result<PathBuf, String> {
 
     #[allow(unreachable_code)]
     home_dir()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_setting_dir;
+    use std::path::PathBuf;
+
+    #[test]
+    fn explicit_setting_dir_wins_before_legacy_fallback() {
+        let explicit = PathBuf::from("explicit-setting");
+        let selected = select_setting_dir(
+            Some(explicit.clone()),
+            PathBuf::from("default-setting"),
+            PathBuf::from("legacy-setting"),
+        );
+
+        assert_eq!(selected, explicit);
+    }
 }

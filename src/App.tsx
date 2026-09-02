@@ -140,6 +140,13 @@ type ExtensionImportSummary = {
   messages: string[];
 };
 
+type AgentImportSummary = {
+  imported: number;
+  failed: number;
+  pending: number;
+  messages: string[];
+};
+
 type MetadataBackfillSummary = {
   updated: number;
   failed: number;
@@ -174,6 +181,16 @@ type ChromeNativeHostStatus = {
   manifest_paths: string[];
   host_path: string;
   extension_id: string;
+  message: string;
+};
+
+type McpConnectorStatus = {
+  installed: boolean;
+  server_path: string;
+  bundled_version: string;
+  installed_version?: string | null;
+  codex_config: string;
+  claude_desktop_config: string;
   message: string;
 };
 
@@ -424,6 +441,7 @@ function categoryMatchesFilter(category: string | undefined, filter: string) {
 
 function App() {
   const [currentWindowLabel, setCurrentWindowLabel] = useState("main");
+  const [windowLabelReady, setWindowLabelReady] = useState(false);
   const isRegisterWindow = currentWindowLabel === "register-paper";
   const isSettingsWindow = currentWindowLabel === "settings";
   const editWindowPaperId = currentWindowLabel.startsWith("edit-paper-")
@@ -447,6 +465,8 @@ function App() {
   );
   const [chromeNativeHostStatus, setChromeNativeHostStatus] =
     useState<ChromeNativeHostStatus | null>(null);
+  const [mcpConnectorStatus, setMcpConnectorStatus] = useState<McpConnectorStatus | null>(null);
+  const [mcpConnectorBusy, setMcpConnectorBusy] = useState(false);
   const [importSource, setImportSource] = useState("");
   const [metadataLoading, setMetadataLoading] = useState(false);
   const [librarySyncing, setLibrarySyncing] = useState(false);
@@ -459,6 +479,8 @@ function App() {
   const focusedPaper = allPapers.find((paper) => paper.id === focusedPaperId) ?? null;
   const utilityMenuRef = useRef<HTMLDivElement | null>(null);
   const importProcessingRef = useRef(false);
+  const agentImportProcessingRef = useRef(false);
+  const mcpConnectorBusyRef = useRef(false);
   const librarySyncingRef = useRef(false);
 
   useEffect(() => {
@@ -466,6 +488,8 @@ function App() {
       setCurrentWindowLabel(getCurrentWebviewWindow().label || "main");
     } catch {
       setCurrentWindowLabel("main");
+    } finally {
+      setWindowLabelReady(true);
     }
   }, []);
 
@@ -618,6 +642,38 @@ function App() {
       }
     } finally {
       importProcessingRef.current = false;
+    }
+  }
+
+  async function processAgentImports(options: { silent?: boolean } = {}) {
+    if (agentImportProcessingRef.current) {
+      return;
+    }
+
+    agentImportProcessingRef.current = true;
+    if (!options.silent) {
+      setError(null);
+    }
+    try {
+      const summary = await invoke<AgentImportSummary>("process_agent_imports");
+      if (summary.imported > 0 || summary.failed > 0) {
+        await loadSavedData();
+        setMessage(
+          `Agent imports: ${summary.imported} imported, ${summary.failed} failed, ${summary.pending} pending.`,
+        );
+      } else if (!options.silent) {
+        setMessage("No Codex or Claude imports are pending.");
+      }
+      if (summary.failed > 0) {
+        setError(summary.messages.join(" ") || "One or more agent imports failed.");
+      }
+    } catch (reason) {
+      if (!options.silent) {
+        setError(String(reason));
+        setMessage("Could not process Codex or Claude imports.");
+      }
+    } finally {
+      agentImportProcessingRef.current = false;
     }
   }
 
@@ -1138,6 +1194,60 @@ function App() {
     }
   }
 
+  async function runMcpConnectorAction(
+    command: "check_mcp_connector" | "install_mcp_connector" | "uninstall_mcp_connector",
+    options: { silent?: boolean } = {},
+  ) {
+    if (mcpConnectorBusyRef.current) {
+      return;
+    }
+
+    mcpConnectorBusyRef.current = true;
+    setMcpConnectorBusy(true);
+    if (!options.silent) {
+      setError(null);
+    }
+    try {
+      const status = await invoke<McpConnectorStatus>(command);
+      setMcpConnectorStatus(status);
+      if (!options.silent) {
+        setMessage(status.message);
+      }
+    } catch (reason) {
+      const detail = String(reason);
+      setError(
+        `MCP connector is unavailable. Development builds must bundle the legra_mcp binary as a Tauri resource. ${detail}`,
+      );
+      setMessage("Could not manage the Codex / Claude connector.");
+    } finally {
+      mcpConnectorBusyRef.current = false;
+      setMcpConnectorBusy(false);
+    }
+  }
+
+  async function checkMcpConnectorStatus(options: { silent?: boolean } = {}) {
+    await runMcpConnectorAction("check_mcp_connector", options);
+  }
+
+  async function installMcpConnector() {
+    await runMcpConnectorAction("install_mcp_connector");
+  }
+
+  async function uninstallMcpConnector() {
+    await runMcpConnectorAction("uninstall_mcp_connector");
+  }
+
+  async function copyMcpConnectorConfig(label: string, content: string) {
+    setError(null);
+    try {
+      await navigator.clipboard.writeText(content);
+      setMessage(`Copied ${label} connector configuration.`);
+    } catch (reason) {
+      setError(String(reason));
+      setMessage(`Could not copy ${label} connector configuration.`);
+    }
+  }
+
   async function openPaperNote(noteId: string) {
     setError(null);
     try {
@@ -1357,11 +1467,16 @@ function App() {
   }
 
   useEffect(() => {
+    if (!windowLabelReady) {
+      return;
+    }
+
     loadSavedData()
       .then(async (nextData) => {
         if (!isRegisterWindow && !isEditWindow && !isSettingsWindow) {
           await syncManagedLibrary({ silent: true }, nextData);
           await processExtensionImports({ silent: true });
+          await processAgentImports({ silent: true });
           await backfillApsMetadata();
         }
       })
@@ -1372,7 +1487,7 @@ function App() {
       .finally(() => {
         setStartupComplete(true);
       });
-  }, []);
+  }, [windowLabelReady]);
 
   useEffect(() => {
     if (!startupComplete || isRegisterWindow || isEditWindow || isSettingsWindow) {
@@ -1380,13 +1495,24 @@ function App() {
     }
 
     const interval = window.setInterval(() => {
-      processExtensionImports({ silent: true }).catch(() => {});
+      void (async () => {
+        await processExtensionImports({ silent: true });
+        await processAgentImports({ silent: true });
+      })();
     }, 15000);
 
     return () => {
       window.clearInterval(interval);
     };
   }, [isEditWindow, isRegisterWindow, isSettingsWindow, startupComplete]);
+
+  useEffect(() => {
+    if (!startupComplete || !isSettingsWindow) {
+      return;
+    }
+
+    void checkMcpConnectorStatus({ silent: true });
+  }, [isSettingsWindow, startupComplete]);
 
   useEffect(() => {
     if (isRegisterWindow || isEditWindow || isSettingsWindow) {
@@ -1414,7 +1540,7 @@ function App() {
 
     let unlisten = () => {};
     listen("paper-manager:data-updated", () => {
-      if (importProcessingRef.current) {
+      if (importProcessingRef.current || agentImportProcessingRef.current) {
         return;
       }
 
@@ -1639,6 +1765,147 @@ function App() {
                 </button>
               </div>
             </label>
+          </div>
+
+          <div className="settings-section connector-settings-section">
+            <div className="compact-heading">
+              <div>
+                <h3>Codex / Claude connector</h3>
+                <p className="settings-help">
+                  Install Legra&apos;s local MCP server, then register it in Codex App or Claude
+                  Desktop. Legra never edits either application&apos;s configuration automatically.
+                </p>
+              </div>
+              {mcpConnectorStatus ? (
+                <span
+                  className={`connector-state ${
+                    mcpConnectorStatus.installed ? "connector-state-installed" : ""
+                  }`}
+                >
+                  {mcpConnectorStatus.installed ? "Installed" : "Not installed"}
+                </span>
+              ) : null}
+            </div>
+
+            <div className="form-action-row compact-action-row">
+              <button
+                type="button"
+                className="secondary-action"
+                disabled={mcpConnectorBusy}
+                onClick={() => checkMcpConnectorStatus()}
+              >
+                {mcpConnectorBusy ? "Working..." : "Check connector"}
+              </button>
+              <button
+                type="button"
+                className="secondary-action"
+                disabled={mcpConnectorBusy}
+                onClick={installMcpConnector}
+              >
+                {mcpConnectorStatus?.installed
+                  ? mcpConnectorStatus.installed_version === mcpConnectorStatus.bundled_version
+                    ? "Reinstall connector"
+                    : "Update connector"
+                  : "Install connector"}
+              </button>
+              <button
+                type="button"
+                className="danger-action"
+                disabled={mcpConnectorBusy || !mcpConnectorStatus?.installed}
+                onClick={uninstallMcpConnector}
+              >
+                Remove connector
+              </button>
+            </div>
+
+            {mcpConnectorStatus ? (
+              <>
+                <dl className="native-host-status connector-status" aria-live="polite">
+                  <dt>Status</dt>
+                  <dd>
+                    {mcpConnectorStatus.installed
+                      ? mcpConnectorStatus.installed_version ===
+                        mcpConnectorStatus.bundled_version
+                        ? "Installed and current"
+                        : "Installed; an update is available"
+                      : "Not installed"}
+                  </dd>
+                  <dt>Server</dt>
+                  <dd>{mcpConnectorStatus.server_path}</dd>
+                  <dt>Bundled</dt>
+                  <dd>{mcpConnectorStatus.bundled_version}</dd>
+                  <dt>Installed</dt>
+                  <dd>{mcpConnectorStatus.installed_version ?? "—"}</dd>
+                  <dt>Details</dt>
+                  <dd>{mcpConnectorStatus.message}</dd>
+                </dl>
+
+                <div className="connector-config-grid">
+                  <section className="connector-config-card">
+                    <div className="connector-config-heading">
+                      <h4>Codex App</h4>
+                      <button
+                        type="button"
+                        className="secondary-action"
+                        onClick={() =>
+                          copyMcpConnectorConfig("Codex", mcpConnectorStatus.codex_config)
+                        }
+                      >
+                        Copy TOML
+                      </button>
+                    </div>
+                    <p className="settings-help">
+                      Open Settings → MCP servers → Add server. Name it Legra, choose STDIO, and
+                      use the absolute server path above as the command. Save, then restart Codex.
+                      The equivalent TOML is shown below; select and copy it if you prefer manual
+                      configuration.
+                    </p>
+                    <pre className="connector-code">
+                      <code>{mcpConnectorStatus.codex_config}</code>
+                    </pre>
+                  </section>
+
+                  <section className="connector-config-card">
+                    <div className="connector-config-heading">
+                      <h4>Claude Desktop</h4>
+                      <button
+                        type="button"
+                        className="secondary-action"
+                        onClick={() =>
+                          copyMcpConnectorConfig(
+                            "Claude Desktop",
+                            mcpConnectorStatus.claude_desktop_config,
+                          )
+                        }
+                      >
+                        Copy JSON
+                      </button>
+                    </div>
+                    <p className="settings-help">
+                      For a release build, open the matching Legra .mcpb package for one-click
+                      installation. For development, open Settings → Developer → Edit Config and
+                      merge the JSON below, then restart Claude Desktop. Do not replace unrelated
+                      server entries.
+                    </p>
+                    <pre className="connector-code">
+                      <code>{mcpConnectorStatus.claude_desktop_config}</code>
+                    </pre>
+                  </section>
+                </div>
+
+                <p className="settings-help connector-removal-help">
+                  Removing the connector deletes Legra&apos;s installed server binary only. Remove
+                  the Legra server entry from Codex or Claude Desktop separately to disconnect it
+                  completely.
+                </p>
+              </>
+            ) : (
+              <p className="settings-help">
+                Check the connector to see its install path and configuration snippets. If this is
+                an unpackaged development build, build and bundle the <code>legra_mcp</code> binary
+                before installing.
+              </p>
+            )}
           </div>
 
           <div className="settings-section">

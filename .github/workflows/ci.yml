@@ -35,12 +35,22 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Check release version consistency
+        run: node scripts/check-version-consistency.mjs
+
       - name: Build frontend
         run: npm run build
 
-      - name: Test Tauri backend and Chrome native host
+      - name: Test Tauri backend and import integrations
         working-directory: src-tauri
         run: cargo test
+
+      - name: Check MCP connector binary
+        working-directory: src-tauri
+        run: cargo check --bin legra_mcp
+
+      - name: Check Claude Desktop MCPB packaging script
+        run: node --check scripts/prepare-mcpb.mjs
 
       - name: Check Chrome extension JavaScript
         run: |

@@ -10,7 +10,18 @@ permissions:
   contents: write
 
 jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Check tag and release version consistency
+        run: node scripts/check-version-consistency.mjs
+
   macos:
+    needs: validate
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -20,27 +31,35 @@ jobs:
           cache: npm
       - uses: dtolnay/rust-toolchain@stable
       - run: npm ci
-      - name: Build native host
+      - name: Build import connectors
         working-directory: src-tauri
         run: |
-          cargo build --release --bin paper_manager_native_host
+          cargo build --release --bin paper_manager_native_host --bin legra_mcp
           mkdir -p release-resources
           cp target/release/paper_manager_native_host release-resources/paper_manager_native_host
+          cp target/release/legra_mcp release-resources/legra_mcp
       - name: Build macOS app
-        run: npm run tauri build -- --bundles app --config '{"bundle":{"resources":{"release-resources/paper_manager_native_host":"paper_manager_native_host"}}}'
-      - name: Prepare macOS asset
+        run: npm run tauri build -- --bundles app --config '{"bundle":{"resources":{"release-resources/paper_manager_native_host":"paper_manager_native_host","release-resources/legra_mcp":"legra_mcp"}}}'
+      - name: Prepare macOS assets
         run: |
           VERSION="$(node -p "require('./package.json').version")"
           mkdir -p release-assets
           ditto -c -k --sequesterRsrc --keepParent \
             src-tauri/target/release/bundle/macos/Legra.app \
             "release-assets/Legra_${VERSION}_aarch64.app.zip"
+          node scripts/prepare-mcpb.mjs \
+            src-tauri/target/release/legra_mcp \
+            darwin \
+            release-mcpb
+          cd release-mcpb
+          zip -qr "../release-assets/Legra_${VERSION}_claude_desktop_macos_arm64.mcpb" .
       - uses: actions/upload-artifact@v4
         with:
           name: legra-macos
           path: release-assets/*
 
   windows:
+    needs: validate
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -50,28 +69,35 @@ jobs:
           cache: npm
       - uses: dtolnay/rust-toolchain@stable
       - run: npm ci
-      - name: Build native host
+      - name: Build import connectors
         working-directory: src-tauri
         shell: pwsh
         run: |
-          cargo build --release --bin paper_manager_native_host
+          cargo build --release --bin paper_manager_native_host --bin legra_mcp
           New-Item -ItemType Directory -Force release-resources
           Copy-Item target/release/paper_manager_native_host.exe release-resources/paper_manager_native_host.exe
+          Copy-Item target/release/legra_mcp.exe release-resources/legra_mcp.exe
       - name: Build Windows installer
-        run: npm run tauri build -- --bundles nsis --config '{"bundle":{"resources":{"release-resources/paper_manager_native_host.exe":"paper_manager_native_host.exe"}}}'
-      - name: Prepare Windows asset
+        run: npm run tauri build -- --bundles nsis --config '{"bundle":{"resources":{"release-resources/paper_manager_native_host.exe":"paper_manager_native_host.exe","release-resources/legra_mcp.exe":"legra_mcp.exe"}}}'
+      - name: Prepare Windows assets
         shell: pwsh
         run: |
           $version = (Get-Content package.json | ConvertFrom-Json).version
           $source = Get-ChildItem src-tauri/target/release/bundle/nsis/*-setup.exe | Select-Object -First 1
           New-Item -ItemType Directory -Force release-assets
           Copy-Item $source.FullName "release-assets/Legra_${version}_windows_x86_64-setup.exe"
+          node scripts/prepare-mcpb.mjs src-tauri/target/release/legra_mcp.exe win32 release-mcpb
+          $mcpbPath = "release-assets/Legra_${version}_claude_desktop_windows_x86_64.mcpb"
+          $mcpbZip = "${mcpbPath}.zip"
+          Compress-Archive -Path release-mcpb\* -DestinationPath $mcpbZip -Force
+          Move-Item $mcpbZip $mcpbPath -Force
       - uses: actions/upload-artifact@v4
         with:
           name: legra-windows
           path: release-assets/*
 
   linux:
+    needs: validate
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -85,14 +111,15 @@ jobs:
           cache: npm
       - uses: dtolnay/rust-toolchain@stable
       - run: npm ci
-      - name: Build native host
+      - name: Build import connectors
         working-directory: src-tauri
         run: |
-          cargo build --release --bin paper_manager_native_host
+          cargo build --release --bin paper_manager_native_host --bin legra_mcp
           mkdir -p release-resources
           cp target/release/paper_manager_native_host release-resources/paper_manager_native_host
+          cp target/release/legra_mcp release-resources/legra_mcp
       - name: Build Linux packages
-        run: npm run tauri build -- --bundles appimage,deb --config '{"bundle":{"resources":{"release-resources/paper_manager_native_host":"paper_manager_native_host"}}}'
+        run: npm run tauri build -- --bundles appimage,deb --config '{"bundle":{"resources":{"release-resources/paper_manager_native_host":"paper_manager_native_host","release-resources/legra_mcp":"legra_mcp"}}}'
       - name: Prepare Linux assets
         run: |
           VERSION="$(node -p "require('./package.json').version")"

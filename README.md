@@ -13,6 +13,7 @@ It is built with Tauri, React, and Rust. The app is designed for researchers who
 - Configure BibTeX citation key rules.
 - Normalize journal names at export time using editable journal aliases.
 - Import metadata and accessible PDFs from Chrome via a companion extension.
+- Queue DOI and arXiv papers found by Codex App or Claude Desktop through a local MCP connector.
 - Create shared workspaces in Google Drive, Dropbox, iCloud Drive, or any synced folder.
 - Keep PDFs and notes as regular files that can be backed up or inspected without Legra.
 
@@ -27,7 +28,10 @@ Legra is not a Zotero or Mendeley replacement. It focuses on a smaller workflow:
 - no account requirement
 - no publisher authentication bypass
 
-The Chrome extension only works with pages and PDFs that the user can legitimately access in their browser.
+The Chrome extension only works with pages and PDFs that the user can legitimately access in their
+browser. The MCP connector accepts DOI and arXiv identifiers only. It makes a best-effort attempt to
+retrieve open-access PDFs and otherwise keeps a metadata-only record; it does not accept arbitrary
+download URLs, reuse browser sessions, bypass paywalls, or circumvent publisher authentication.
 
 ## Current Limitations
 
@@ -57,6 +61,13 @@ On macOS, install Legra with Homebrew:
 ```sh
 brew tap KokiMizuno531/legra
 brew install --cask legra
+```
+
+Upgrade an existing installation:
+
+```sh
+brew update
+brew upgrade --cask legra
 ```
 
 Open Legra:
@@ -131,7 +142,87 @@ Check the Rust backend:
 cd src-tauri
 cargo check
 cargo check --bin paper_manager_native_host
+cargo check --bin legra_mcp
 ```
+
+## Codex App and Claude Desktop
+
+Legra ships a local MCP server named `legra_mcp`. It lets Codex App and Claude Desktop check the
+library, list categories, normalize a DOI or arXiv identifier and check for an existing record,
+queue an import, and check the queued job's result. The MCP process never writes Legra's catalog or
+managed PDF directory directly. It places a versioned job in Legra's import queue; the Legra app
+validates and performs the import.
+
+### Codex App
+
+1. Open Legra and go to `Settings -> Codex / Claude connector`.
+2. Click `Install connector`, then `Check connector`.
+3. Click `Copy TOML` and merge the copied table into `~/.codex/config.toml` without replacing
+   unrelated settings.
+4. Restart Codex App, open a new task, and use `/mcp` to confirm that `legra` is connected.
+
+Legra also shows a ready-to-copy TOML snippet. Its shape is:
+
+```toml
+[mcp_servers.legra]
+command = "/absolute/path/to/legra_mcp"
+env = { LEGRA_SETTING_DIR = "/absolute/path/to/Legra/data" }
+default_tools_approval_mode = "writes"
+```
+
+Legra installs or updates only its own connector binary. It does not modify Codex configuration.
+Codex App's `Settings -> MCP servers -> Add server` STDIO form is also available for a standard data
+directory, but the generated TOML is recommended because it preserves `LEGRA_SETTING_DIR` and the
+write approval policy. Codex desktop, CLI, and the IDE extension share this configuration on the
+same host.
+
+For complete installation, upgrade, verification, prompt examples, and troubleshooting steps, see
+[Import papers from Codex App or Claude Desktop](docs/codex-claude-paper-import.md).
+
+### Claude Desktop
+
+For a packaged release on macOS or Windows, download the matching file from GitHub Releases and
+open it with Claude Desktop:
+
+- `Legra_<version>_claude_desktop_macos_arm64.mcpb`
+- `Legra_<version>_claude_desktop_windows_x86_64.mcpb`
+
+The MCPB is the recommended one-click installation route. Linux is not currently an official Claude
+Desktop target, so Legra does not publish a Linux MCPB.
+
+For an unpackaged development build, use the manual fallback: install the connector from Legra
+Settings, open Claude Desktop's `Settings -> Developer -> Edit Config`, and merge the JSON snippet
+shown by Legra into the existing configuration. Do not replace unrelated MCP server entries. The
+snippet has this shape:
+
+```json
+{
+  "mcpServers": {
+    "legra": {
+      "command": "/absolute/path/to/legra_mcp",
+      "args": [],
+      "env": {
+        "LEGRA_SETTING_DIR": "/absolute/path/to/Legra/data"
+      }
+    }
+  }
+}
+```
+
+Restart Claude Desktop after installing the MCPB or editing its developer configuration.
+
+### Queue and download behavior
+
+When Legra is running in its main window, it processes agent jobs at startup and every 15 seconds.
+When Legra is closed, Codex or Claude can still enqueue an import; the job remains pending and is
+processed the next time Legra starts. Consequently, an MCP `import_paper` result confirms that the
+job was queued, not necessarily that a PDF has already been downloaded. Use `get_import_status` to
+distinguish `pending`, `processing`, `done`, and `failed` jobs.
+
+Agent imports accept normalized DOI or arXiv identifiers only. PDF retrieval is unauthenticated and
+best-effort: arXiv or a direct PDF link advertised by Crossref may yield a PDF, while inaccessible
+DOI records are registered as metadata-only. `open_access_only` means Legra will not use a logged-in
+session or bypass a paywall; it is not a legal determination of the document's reuse license.
 
 ## Chrome Extension
 
@@ -182,6 +273,18 @@ brew install --cask legra
 ```
 
 A copy of the cask is also kept in [Packaging/homebrew](Packaging/homebrew) for reference.
+
+Upgrade an installed cask with:
+
+```sh
+brew update
+brew upgrade --cask legra
+open -a Legra
+```
+
+Launching the upgraded app refreshes an already-installed MCP connector when its version changes.
+Install the connector from Settings if it has never been installed, then restart Codex so it starts
+the updated MCP binary.
 
 After installing on any supported operating system, open Legra, set the Chrome extension ID in Settings, and click `Install Native Host` to enable Chrome or Chromium import. If Chrome still reports old category behavior after an app update, reinstall the Native Host from Settings; reloading the Chrome extension alone does not refresh the Native Host binary.
 

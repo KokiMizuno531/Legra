@@ -599,6 +599,89 @@ dd {
   color: var(--text-muted);
 }
 
+.connector-settings-section {
+  gap: 14px;
+}
+
+.connector-state {
+  flex: 0 0 auto;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  padding: 3px 9px;
+  background: var(--bg-main);
+  color: var(--text-dim);
+  font-size: 0.688rem;
+  font-weight: 700;
+}
+
+.connector-state-installed {
+  border-color: rgba(16, 185, 129, 0.25);
+  background: var(--accent-soft);
+  color: var(--accent-hover);
+}
+
+.connector-status {
+  grid-template-columns: 88px minmax(0, 1fr);
+}
+
+.connector-config-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr));
+  gap: 12px;
+}
+
+.connector-config-card {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-main);
+}
+
+.connector-config-card h4 {
+  margin: 0;
+  color: var(--text-main);
+  font-size: 0.813rem;
+}
+
+.connector-config-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.connector-config-heading .secondary-action {
+  flex: 0 0 auto;
+  padding: 5px 9px;
+  font-size: 0.688rem;
+}
+
+.connector-code {
+  max-height: 220px;
+  margin: 0;
+  overflow: auto;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  padding: 10px;
+  background: var(--bg-panel);
+  color: var(--text-main);
+  font-family: 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
+  font-size: 0.688rem;
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+  user-select: text;
+  white-space: pre-wrap;
+}
+
+.connector-removal-help {
+  padding-left: 10px;
+  border-left: 2px solid var(--border-strong);
+}
+
 .compact-heading {
   display: flex;
   align-items: center;

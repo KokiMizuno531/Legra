@@ -86,24 +86,12 @@ fn app_root_dir() -> Result<PathBuf, String> {
         .ok_or_else(|| "Could not resolve native host directory.".to_string())
 }
 
-fn default_setting_dir() -> Result<PathBuf, String> {
-    platform::default_setting_dir()
-}
-
 fn legacy_setting_dir() -> Result<PathBuf, String> {
     Ok(app_root_dir()?.join("setting"))
 }
 
 fn setting_dir() -> Result<PathBuf, String> {
-    let default_dir = default_setting_dir()?;
-    let legacy_dir = legacy_setting_dir()?;
-    let default_data = default_dir.join("app-data.json");
-    let legacy_data = legacy_dir.join("app-data.json");
-    if legacy_data.exists() && !default_data.exists() {
-        return Ok(legacy_dir);
-    }
-
-    Ok(default_dir)
+    platform::setting_dir_with_legacy(legacy_setting_dir()?)
 }
 
 fn pending_dir() -> Result<PathBuf, String> {

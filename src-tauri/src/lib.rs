@@ -3,13 +3,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
-    fs::{self, File},
-    io::Read,
+    fs::{self, File, OpenOptions},
+    io::{Read, Write},
+    net::{IpAddr, ToSocketAddrs},
     path::{Path, PathBuf},
     process::Command,
     sync::{
         atomic::{AtomicU64, Ordering},
-        OnceLock,
+        Mutex, OnceLock,
     },
     time::Duration,
     time::{SystemTime, UNIX_EPOCH},
@@ -20,11 +21,14 @@ use tauri::{
     Emitter, Manager,
 };
 
+pub mod agent_bridge;
 mod platform;
 
 const SETTINGS_MENU_ID: &str = "settings";
 const CHROME_NATIVE_HOST_NAME: &str = "app.legra.importer";
 const MANAGED_LIBRARY_SCHEMA_VERSION: u32 = 1;
+const MAX_PDF_DOWNLOAD_BYTES: u64 = 100 * 1024 * 1024;
+const MCP_CONNECTOR_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn default_pdf_status() -> String {
     "available".to_string()
@@ -217,6 +221,14 @@ struct ExtensionImportSummary {
 }
 
 #[derive(Debug, Serialize)]
+struct AgentImportSummary {
+    imported: usize,
+    failed: usize,
+    pending: usize,
+    messages: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
 struct MetadataBackfillSummary {
     updated: usize,
     failed: usize,
@@ -292,6 +304,17 @@ struct ChromeNativeHostStatus {
     manifest_paths: Vec<String>,
     host_path: String,
     extension_id: String,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
+struct McpConnectorStatus {
+    installed: bool,
+    server_path: String,
+    bundled_version: String,
+    installed_version: Option<String>,
+    codex_config: String,
+    claude_desktop_config: String,
     message: String,
 }
 
@@ -384,6 +407,13 @@ struct RegisterPaperInput {
     folder_category: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct RegisteredImport {
+    paper_id: String,
+    title: String,
+    pdf_path: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct AppStatus {
     setting_dir: String,
@@ -399,24 +429,12 @@ fn app_root_dir() -> Result<PathBuf, String> {
         .ok_or_else(|| "Could not resolve application directory".to_string())
 }
 
-fn default_setting_dir() -> Result<PathBuf, String> {
-    platform::default_setting_dir()
-}
-
 fn legacy_setting_dir() -> Result<PathBuf, String> {
     Ok(app_root_dir()?.join("setting"))
 }
 
 fn setting_dir() -> Result<PathBuf, String> {
-    let default_dir = default_setting_dir()?;
-    let legacy_dir = legacy_setting_dir()?;
-    let default_data = default_dir.join("app-data.json");
-    let legacy_data = legacy_dir.join("app-data.json");
-    if legacy_data.exists() && !default_data.exists() {
-        return Ok(legacy_dir);
-    }
-
-    Ok(default_dir)
+    platform::setting_dir_with_legacy(legacy_setting_dir()?)
 }
 
 fn data_file_path() -> Result<PathBuf, String> {
@@ -726,6 +744,56 @@ fn bundled_native_host_binary_path(app: &tauri::AppHandle) -> Result<PathBuf, St
     }
 
     Err("Chrome Native Host binary is not bundled. Build or install Legra first.".to_string())
+}
+
+fn installed_mcp_server_binary_path() -> Result<PathBuf, String> {
+    Ok(setting_dir()?
+        .join("mcp")
+        .join(platform::MCP_SERVER_BINARY_NAME))
+}
+
+fn installed_mcp_server_version_path() -> Result<PathBuf, String> {
+    Ok(setting_dir()?.join("mcp").join("version"))
+}
+
+fn bundled_mcp_server_binary_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let resource_path = app
+        .path()
+        .resolve(platform::MCP_SERVER_BINARY_NAME, BaseDirectory::Resource)
+        .map_err(|error| error.to_string())?;
+    if resource_path.exists() {
+        return Ok(resource_path);
+    }
+
+    let legacy_resource_path = app
+        .path()
+        .resolve(
+            format!("release-resources/{}", platform::MCP_SERVER_BINARY_NAME),
+            BaseDirectory::Resource,
+        )
+        .map_err(|error| error.to_string())?;
+    if legacy_resource_path.exists() {
+        return Ok(legacy_resource_path);
+    }
+
+    let app_dir = app_root_dir()?;
+    for candidate in [
+        app_dir.join(platform::MCP_SERVER_BINARY_NAME),
+        app_dir
+            .join("..")
+            .join("debug")
+            .join(platform::MCP_SERVER_BINARY_NAME),
+        app_dir
+            .join("..")
+            .join("release")
+            .join(platform::MCP_SERVER_BINARY_NAME),
+    ] {
+        if candidate.exists() {
+            return fs::canonicalize(candidate).map_err(|error| error.to_string());
+        }
+    }
+
+    Err("Legra MCP server binary is not bundled. Build or install Legra first.".to_string())
 }
 
 #[cfg(target_os = "windows")]
@@ -1474,13 +1542,21 @@ fn normalize_arxiv_id(value: &str) -> String {
 
 fn normalize_doi(value: &str) -> String {
     let trimmed = value.trim();
-    let without_url = trimmed
-        .trim_start_matches("https://doi.org/")
-        .trim_start_matches("http://doi.org/")
-        .trim_start_matches("https://dx.doi.org/")
-        .trim_start_matches("http://dx.doi.org/")
-        .trim_start_matches("doi:")
-        .trim_start_matches("DOI:");
+    let lowercase = trimmed.to_ascii_lowercase();
+    let without_url = [
+        "https://doi.org/",
+        "http://doi.org/",
+        "https://dx.doi.org/",
+        "http://dx.doi.org/",
+        "doi:",
+    ]
+    .into_iter()
+    .find_map(|prefix| {
+        lowercase
+            .starts_with(prefix)
+            .then(|| &trimmed[prefix.len()..])
+    })
+    .unwrap_or(trimmed);
     without_url
         .split(['?', '#'])
         .next()
@@ -1488,6 +1564,33 @@ fn normalize_doi(value: &str) -> String {
         .trim()
         .trim_end_matches('.')
         .to_string()
+}
+
+fn canonical_doi(value: Option<&str>) -> Option<String> {
+    value
+        .map(normalize_doi)
+        .map(|doi| doi.to_ascii_lowercase())
+        .filter(|doi| !doi.is_empty())
+}
+
+fn canonical_arxiv_id(value: Option<&str>) -> Option<String> {
+    value
+        .map(normalize_arxiv_id)
+        .map(|arxiv_id| arxiv_id.to_ascii_lowercase())
+        .filter(|arxiv_id| !arxiv_id.is_empty())
+}
+
+fn arxiv_id_from_doi(value: Option<&str>) -> Option<String> {
+    canonical_doi(value).and_then(|doi| {
+        doi.strip_prefix("10.48550/arxiv.")
+            .map(normalize_arxiv_id)
+            .map(|arxiv_id| arxiv_id.to_ascii_lowercase())
+            .filter(|arxiv_id| !arxiv_id.is_empty())
+    })
+}
+
+fn canonical_paper_arxiv_id(arxiv_id: Option<&str>, doi: Option<&str>) -> Option<String> {
+    canonical_arxiv_id(arxiv_id).or_else(|| arxiv_id_from_doi(doi))
 }
 
 fn looks_like_arxiv(value: &str) -> bool {
@@ -1518,7 +1621,11 @@ fn resolve_import_identifiers(source: &str) -> Result<(Option<String>, Option<St
     }
 
     if looks_like_doi(source) {
-        return Ok((Some(normalize_doi(source)), None));
+        let doi = normalize_doi(source);
+        if let Some(arxiv_id) = arxiv_id_from_doi(Some(&doi)) {
+            return Ok((None, Some(arxiv_id)));
+        }
+        return Ok((Some(doi), None));
     }
 
     if looks_like_arxiv(source) {
@@ -2386,10 +2493,114 @@ fn imports_dir() -> Result<PathBuf, String> {
     Ok(setting_dir()?.join("imports"))
 }
 
+fn ip_is_restricted_for_download(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let [a, b, c, _] = ip.octets();
+            a == 0
+                || a == 10
+                || a == 127
+                || (a == 100 && (64..=127).contains(&b))
+                || (a == 169 && b == 254)
+                || (a == 172 && (16..=31).contains(&b))
+                || (a == 192 && b == 168)
+                || (a == 192 && b == 0 && c == 0)
+                || (a == 192 && b == 0 && c == 2)
+                || (a == 198 && (b == 18 || b == 19))
+                || (a == 198 && b == 51 && c == 100)
+                || (a == 203 && b == 0 && c == 113)
+                || a >= 224
+        }
+        IpAddr::V6(ip) => {
+            let octets = ip.octets();
+            let segments = ip.segments();
+            ip.is_unspecified()
+                || ip.is_loopback()
+                || ip.is_multicast()
+                || (octets[0] & 0xfe) == 0xfc
+                || (octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80)
+                || (octets[0] == 0xfe && (octets[1] & 0xc0) == 0xc0)
+                || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+                || ip
+                    .to_ipv4_mapped()
+                    .is_some_and(|mapped| ip_is_restricted_for_download(IpAddr::V4(mapped)))
+        }
+    }
+}
+
+fn validate_pdf_download_url(url: &reqwest::Url) -> Result<(), String> {
+    if url.scheme() != "https" {
+        return Err("PDF downloads require an HTTPS URL.".to_string());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("PDF download URLs must not contain credentials.".to_string());
+    }
+
+    let host = url
+        .host_str()
+        .ok_or_else(|| "PDF download URL does not contain a host.".to_string())?;
+    let normalized_host = host.trim_end_matches('.').to_ascii_lowercase();
+    if normalized_host == "localhost" || normalized_host.ends_with(".localhost") {
+        return Err("PDF downloads from localhost are not allowed.".to_string());
+    }
+
+    if let Ok(ip) = normalized_host.parse::<IpAddr>() {
+        if ip_is_restricted_for_download(ip) {
+            return Err(
+                "PDF downloads from local or private addresses are not allowed.".to_string(),
+            );
+        }
+        return Ok(());
+    }
+
+    let port = url.port_or_known_default().unwrap_or(443);
+    let addresses = (host, port)
+        .to_socket_addrs()
+        .map_err(|error| format!("Could not resolve PDF download host: {error}"))?
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        return Err("PDF download host did not resolve to an address.".to_string());
+    }
+    if addresses
+        .iter()
+        .any(|address| ip_is_restricted_for_download(address.ip()))
+    {
+        return Err("PDF download host resolves to a local or private address.".to_string());
+    }
+
+    Ok(())
+}
+
+fn pdf_download_http_client() -> Result<reqwest::blocking::Client, String> {
+    let redirect_policy = reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= 10 {
+            return attempt.error("PDF download redirected too many times");
+        }
+        match validate_pdf_download_url(attempt.url()) {
+            Ok(()) => attempt.follow(),
+            Err(error) => attempt.error(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                error,
+            )),
+        }
+    });
+
+    reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(120))
+        .redirect(redirect_policy)
+        .user_agent(format!("legra/{}", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|error| error.to_string())
+}
+
 fn download_pdf(url: &str, file_stem: &str) -> Result<PathBuf, String> {
-    let client = metadata_http_client()?;
-    let response = client
-        .get(url)
+    let parsed_url = reqwest::Url::parse(url)
+        .map_err(|error| format!("Could not parse PDF download URL: {error}"))?;
+    validate_pdf_download_url(&parsed_url)?;
+    let client = pdf_download_http_client()?;
+    let mut response = client
+        .get(parsed_url)
         .send()
         .map_err(|error| format!("Could not download PDF: {error}"))?;
 
@@ -2399,19 +2610,81 @@ fn download_pdf(url: &str, file_stem: &str) -> Result<PathBuf, String> {
             response.status()
         ));
     }
-
-    let bytes = response
-        .bytes()
-        .map_err(|error| format!("Could not read PDF download: {error}"))?;
-    if !bytes.starts_with(b"%PDF") {
-        return Err("Downloaded file was not a PDF.".to_string());
+    validate_pdf_download_url(response.url())?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_PDF_DOWNLOAD_BYTES)
+    {
+        return Err(format!(
+            "PDF download exceeds the {} MiB limit.",
+            MAX_PDF_DOWNLOAD_BYTES / 1024 / 1024
+        ));
     }
 
     let dir = imports_dir()?;
     fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
     let file_name = format!("{}.pdf", sanitize_filename(file_stem));
     let target = unique_path(&dir, &file_name);
-    fs::write(&target, &bytes).map_err(|error| error.to_string())?;
+    let temporary_name = format!(
+        ".{}.{}.part",
+        sanitize_filename(file_stem),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| error.to_string())?
+            .as_nanos()
+    );
+    let temporary = unique_path(&dir, &temporary_name);
+    let write_result = (|| -> Result<(), String> {
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|error| format!("Could not create temporary PDF file: {error}"))?;
+        let mut prefix = Vec::with_capacity(5);
+        let mut total = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+
+        loop {
+            let read = response
+                .read(&mut buffer)
+                .map_err(|error| format!("Could not read PDF download: {error}"))?;
+            if read == 0 {
+                break;
+            }
+            total = total
+                .checked_add(read as u64)
+                .ok_or_else(|| "PDF download size overflowed.".to_string())?;
+            if total > MAX_PDF_DOWNLOAD_BYTES {
+                return Err(format!(
+                    "PDF download exceeds the {} MiB limit.",
+                    MAX_PDF_DOWNLOAD_BYTES / 1024 / 1024
+                ));
+            }
+            if prefix.len() < 5 {
+                let remaining = 5 - prefix.len();
+                prefix.extend_from_slice(&buffer[..read.min(remaining)]);
+            }
+            output
+                .write_all(&buffer[..read])
+                .map_err(|error| format!("Could not write PDF download: {error}"))?;
+        }
+
+        if !prefix.starts_with(b"%PDF-") {
+            return Err("Downloaded file was not a PDF.".to_string());
+        }
+        output
+            .sync_all()
+            .map_err(|error| format!("Could not sync PDF download: {error}"))?;
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    fs::rename(&temporary, &target).map_err(|error| {
+        let _ = fs::remove_file(&temporary);
+        format!("Could not finalize PDF download: {error}")
+    })?;
     Ok(target)
 }
 
@@ -3311,9 +3584,12 @@ fn ensure_not_duplicate(
     id: Option<&str>,
     title: &str,
     doi: &Option<String>,
+    arxiv_id: &Option<String>,
     pdf_path: &Option<String>,
 ) -> Result<(), String> {
-    let input_doi = doi.as_deref().map(normalize_key);
+    let input_doi = canonical_doi(doi.as_deref());
+    let input_arxiv_id = canonical_paper_arxiv_id(arxiv_id.as_deref(), doi.as_deref());
+    let has_input_identifier = input_doi.is_some() || input_arxiv_id.is_some();
     let input_title = normalize_key(title);
     let input_pdf_path = pdf_path.as_deref().map(normalize_key);
 
@@ -3322,14 +3598,22 @@ fn ensure_not_duplicate(
             continue;
         }
 
-        if let (Some(existing), Some(next)) = (paper.doi.as_deref().map(normalize_key), &input_doi)
-        {
+        if let (Some(existing), Some(next)) = (canonical_doi(paper.doi.as_deref()), &input_doi) {
             if existing == *next {
                 return Err("A paper with the same DOI already exists.".to_string());
             }
         }
 
-        if normalize_key(&paper.title) == input_title {
+        if let (Some(existing), Some(next)) = (
+            canonical_paper_arxiv_id(paper.arxiv_id.as_deref(), paper.doi.as_deref()),
+            &input_arxiv_id,
+        ) {
+            if existing == *next {
+                return Err("A paper with the same arXiv ID already exists.".to_string());
+            }
+        }
+
+        if !has_input_identifier && normalize_key(&paper.title) == input_title {
             return Err("A paper with the same title already exists.".to_string());
         }
 
@@ -3365,7 +3649,14 @@ fn register_paper_input(input: RegisterPaperInput) -> Result<AppData, String> {
 
     let mut data = load_or_default_app_data()?;
     let pdf_path = normalize_pdf_storage_path(&data, &input.pdf_path)?;
-    ensure_not_duplicate(&data, None, &input.title, &input.doi, &pdf_path)?;
+    ensure_not_duplicate(
+        &data,
+        None,
+        &input.title,
+        &input.doi,
+        &input.arxiv_id,
+        &pdf_path,
+    )?;
 
     let timestamp = current_timestamp()?;
     let paper = Paper {
@@ -3427,19 +3718,45 @@ fn merge_tags(existing: &mut Vec<String>, incoming: Vec<String>) {
 fn register_or_update_import_input_into_data(
     data: &mut AppData,
     input: RegisterPaperInput,
-) -> Result<String, String> {
+) -> Result<RegisteredImport, String> {
     let valid_pdf_path = normalize_pdf_storage_path(data, &input.pdf_path)?;
-    let input_doi = input.doi.as_deref().map(normalize_key);
+    let input_doi = canonical_doi(input.doi.as_deref());
+    let input_arxiv_id = canonical_paper_arxiv_id(input.arxiv_id.as_deref(), input.doi.as_deref());
+    let has_input_identifier = input_doi.is_some() || input_arxiv_id.is_some();
     let input_title = normalize_key(&input.title);
-    let existing_index = data.papers.iter().position(|paper| {
-        input_doi
-            .as_ref()
-            .is_some_and(|doi| paper.doi.as_deref().map(normalize_key).as_ref() == Some(doi))
-            || normalize_key(&paper.title) == input_title
+    let doi_match = input_doi.as_ref().and_then(|doi| {
+        data.papers
+            .iter()
+            .position(|paper| canonical_doi(paper.doi.as_deref()).as_ref() == Some(doi))
+    });
+    let arxiv_match = input_arxiv_id.as_ref().and_then(|arxiv_id| {
+        data.papers.iter().position(|paper| {
+            canonical_paper_arxiv_id(paper.arxiv_id.as_deref(), paper.doi.as_deref()).as_ref()
+                == Some(arxiv_id)
+        })
+    });
+    if doi_match.is_some() && arxiv_match.is_some() && doi_match != arxiv_match {
+        return Err(
+            "The DOI and arXiv ID match different papers already in the library.".to_string(),
+        );
+    }
+    let existing_index = doi_match.or(arxiv_match).or_else(|| {
+        (!has_input_identifier).then(|| {
+            data.papers
+                .iter()
+                .position(|paper| normalize_key(&paper.title) == input_title)
+        })?
     });
 
     let Some(paper_index) = existing_index else {
-        ensure_not_duplicate(data, None, &input.title, &input.doi, &valid_pdf_path)?;
+        ensure_not_duplicate(
+            data,
+            None,
+            &input.title,
+            &input.doi,
+            &input.arxiv_id,
+            &valid_pdf_path,
+        )?;
         let timestamp = current_timestamp()?;
         let paper = Paper {
             id: now_id()?,
@@ -3458,8 +3775,8 @@ fn register_or_update_import_input_into_data(
             numpages: input.numpages,
             month: normalize_optional(input.month),
             publisher: normalize_optional(input.publisher),
-            doi: normalize_optional(input.doi),
-            arxiv_id: normalize_optional(input.arxiv_id),
+            doi: input_doi.clone(),
+            arxiv_id: input_arxiv_id.clone(),
             url: normalize_optional(input.url),
             abstract_text: normalize_optional(input.abstract_text),
             tags: input
@@ -3495,7 +3812,11 @@ fn register_or_update_import_input_into_data(
             let folder_category = data.papers[paper_index].folder_category.clone();
             organize_pdf_for_paper(data, paper_index, folder_category)?;
         }
-        return Ok(data.papers[paper_index].title.clone());
+        return Ok(RegisteredImport {
+            paper_id: data.papers[paper_index].id.clone(),
+            title: data.papers[paper_index].title.clone(),
+            pdf_path: data.papers[paper_index].pdf_path.clone(),
+        });
     };
 
     let timestamp = current_timestamp()?;
@@ -3530,10 +3851,10 @@ fn register_or_update_import_input_into_data(
             paper.publisher = normalize_optional(input.publisher.clone());
         }
         if paper.doi.is_none() {
-            paper.doi = normalize_optional(input.doi.clone());
+            paper.doi = input_doi.clone();
         }
         if paper.arxiv_id.is_none() {
-            paper.arxiv_id = normalize_optional(input.arxiv_id.clone());
+            paper.arxiv_id = input_arxiv_id.clone();
         }
         if paper.url.is_none() {
             paper.url = normalize_optional(input.url.clone());
@@ -3560,7 +3881,11 @@ fn register_or_update_import_input_into_data(
         organize_pdf_for_paper(data, paper_index, folder_category)?;
     }
 
-    Ok(data.papers[paper_index].title.clone())
+    Ok(RegisteredImport {
+        paper_id: data.papers[paper_index].id.clone(),
+        title: data.papers[paper_index].title.clone(),
+        pdf_path: data.papers[paper_index].pdf_path.clone(),
+    })
 }
 
 fn metadata_for_import_request(
@@ -3948,14 +4273,14 @@ fn process_extension_import_file_into_data(
         .or_else(|| request.arxiv_id.clone())
         .unwrap_or_else(|| "import request".to_string());
     let input = import_request_to_register_input(request)?;
-    let paper_title = register_or_update_import_input_into_data(data, input)?;
+    let imported = register_or_update_import_input_into_data(data, input)?;
     move_import_file(path, &extension_import_processed_dir()?)?;
     Ok(format!(
         "Imported \"{}\".",
-        if paper_title.is_empty() {
+        if imported.title.is_empty() {
             title_hint
         } else {
-            paper_title
+            imported.title
         }
     ))
 }
@@ -4200,6 +4525,303 @@ fn process_extension_imports(app: tauri::AppHandle) -> Result<ExtensionImportSum
     })
 }
 
+fn agent_origin_tag(origin: &str) -> String {
+    let value = origin
+        .trim()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .take(80)
+        .collect::<String>();
+    format!(
+        "origin:{}",
+        if value.trim_matches('-').is_empty() {
+            "unknown"
+        } else {
+            value.trim_matches('-')
+        }
+    )
+}
+
+fn register_input_for_agent_import(
+    request: &agent_bridge::AgentImportRequest,
+    metadata: PaperMetadata,
+    pdf_path: Option<&Path>,
+    warnings: &[String],
+) -> Result<RegisterPaperInput, String> {
+    let title = metadata
+        .title
+        .clone()
+        .map(|title| clean_text(&title))
+        .filter(|title| !title.is_empty())
+        .ok_or_else(|| "Resolved paper metadata did not contain a title.".to_string())?;
+    let authors = metadata
+        .authors
+        .iter()
+        .map(|author| clean_text(author))
+        .filter(|author| !author.is_empty())
+        .collect::<Vec<_>>();
+    if authors.is_empty() {
+        return Err("Resolved paper metadata did not contain authors.".to_string());
+    }
+
+    let mut tags = request.tags.clone();
+    merge_tags(&mut tags, vec!["agent-import".to_string()]);
+    merge_tags(&mut tags, vec![agent_origin_tag(&request.origin)]);
+    if !warnings.is_empty() && pdf_path.is_none() {
+        merge_tags(&mut tags, vec!["pdf-missing".to_string()]);
+    }
+
+    let (identifier_doi, identifier_arxiv) = match request.identifier.kind {
+        agent_bridge::IdentifierKind::Doi => (canonical_doi(Some(&request.identifier.value)), None),
+        agent_bridge::IdentifierKind::Arxiv => {
+            (None, canonical_arxiv_id(Some(&request.identifier.value)))
+        }
+    };
+
+    Ok(RegisterPaperInput {
+        title,
+        authors,
+        year: metadata.year,
+        publication: metadata.publication,
+        volume: metadata.volume,
+        issue: metadata.issue,
+        pages: metadata.pages,
+        numpages: metadata.numpages,
+        month: metadata.month,
+        publisher: metadata.publisher,
+        doi: canonical_doi(metadata.doi.as_deref()).or(identifier_doi),
+        arxiv_id: canonical_arxiv_id(metadata.arxiv_id.as_deref()).or(identifier_arxiv),
+        url: metadata.url,
+        abstract_text: metadata.abstract_text,
+        tags,
+        status: Some("unread".to_string()),
+        pdf_path: pdf_path.map(|path| path.to_string_lossy().into_owned()),
+        folder_category: request.category.clone(),
+    })
+}
+
+fn same_runtime_file(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn cleanup_unused_agent_download(data: &AppData, downloaded: &Path, registered: &RegisteredImport) {
+    if !downloaded.exists() {
+        return;
+    }
+    let registered_uses_download = registered
+        .pdf_path
+        .as_deref()
+        .map(|path| path_for_runtime(data, path))
+        .is_some_and(|path| same_runtime_file(&path, downloaded));
+    if !registered_uses_download {
+        let _ = fs::remove_file(downloaded);
+    }
+}
+
+fn process_claimed_agent_import(
+    request: &agent_bridge::AgentImportRequest,
+) -> Result<(RegisteredImport, Vec<String>), String> {
+    if request.schema_version != agent_bridge::AGENT_IMPORT_SCHEMA_VERSION {
+        return Err(format!(
+            "Unsupported agent import schema version {}.",
+            request.schema_version
+        ));
+    }
+
+    let mut warnings = Vec::new();
+    let (metadata, identifier) = match request.identifier.kind {
+        agent_bridge::IdentifierKind::Doi => {
+            let identifier = canonical_doi(Some(&request.identifier.value))
+                .ok_or_else(|| "Agent import DOI is empty.".to_string())?;
+            (fetch_doi_metadata(&identifier)?, identifier)
+        }
+        agent_bridge::IdentifierKind::Arxiv => {
+            let identifier = canonical_arxiv_id(Some(&request.identifier.value))
+                .ok_or_else(|| "Agent import arXiv ID is empty.".to_string())?;
+            (fetch_arxiv_metadata(&identifier)?, identifier)
+        }
+    };
+
+    let downloaded = if request.download_policy == agent_bridge::DownloadPolicy::MetadataOnly {
+        None
+    } else {
+        match request.identifier.kind {
+            agent_bridge::IdentifierKind::Arxiv => match download_arxiv_pdf(&identifier) {
+                Ok(path) => Some(path),
+                Err(error) => {
+                    warnings.push(format!(
+                        "Could not download the open arXiv PDF; metadata was imported instead: {error}"
+                    ));
+                    None
+                }
+            },
+            agent_bridge::IdentifierKind::Doi => match download_crossref_pdf(&identifier) {
+                Ok(Some(path)) => Some(path),
+                Ok(None) => {
+                    warnings.push(
+                        "Crossref did not provide a direct open PDF link; metadata was imported instead."
+                            .to_string(),
+                    );
+                    None
+                }
+                Err(error) => {
+                    warnings.push(format!(
+                        "Could not download the Crossref PDF; metadata was imported instead: {error}"
+                    ));
+                    None
+                }
+            },
+        }
+    };
+
+    let operation = (|| -> Result<(AppData, RegisteredImport), String> {
+        let mut data = load_or_default_app_data()?;
+        let input =
+            register_input_for_agent_import(request, metadata, downloaded.as_deref(), &warnings)?;
+        let registered = register_or_update_import_input_into_data(&mut data, input)?;
+        save_data_file(&data)?;
+        Ok((data, registered))
+    })();
+
+    match operation {
+        Ok((data, registered)) => {
+            if let Some(downloaded) = downloaded.as_deref() {
+                cleanup_unused_agent_download(&data, downloaded, &registered);
+            }
+            Ok((registered, warnings))
+        }
+        Err(error) => {
+            if let Some(downloaded) = downloaded.as_deref() {
+                if downloaded.exists() {
+                    let _ = fs::remove_file(downloaded);
+                }
+            }
+            Err(error)
+        }
+    }
+}
+
+fn failed_agent_import_result(job_id: &str, error: &str) -> agent_bridge::AgentImportResult {
+    let mut result = agent_bridge::AgentImportResult::failed(job_id, error);
+    result.details = Some(serde_json::json!({ "error": error }));
+    result
+}
+
+#[tauri::command]
+fn process_agent_imports(app: tauri::AppHandle) -> Result<AgentImportSummary, String> {
+    static PROCESS_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let _guard = PROCESS_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| "Agent import processor lock was poisoned.".to_string())?;
+    agent_bridge::agent_import_dirs()?.ensure()?;
+
+    let recovered = agent_bridge::recover_stale_processing_imports(Duration::from_secs(10 * 60))?;
+    let job_ids = agent_bridge::list_pending_import_ids()?;
+    let mut imported = 0;
+    let mut failed = 0;
+    let mut messages = if recovered > 0 {
+        vec![format!(
+            "Recovered {recovered} interrupted agent import job(s)."
+        )]
+    } else {
+        Vec::new()
+    };
+
+    for job_id in job_ids {
+        let claimed = match agent_bridge::claim_pending_import(&job_id) {
+            Ok(Some(path)) => path,
+            Ok(None) => continue,
+            Err(error) => {
+                failed += 1;
+                messages.push(format!("Could not claim agent import {job_id}: {error}"));
+                continue;
+            }
+        };
+        let request = match agent_bridge::read_claimed_import(&job_id) {
+            Ok(request) => request,
+            Err(error) => {
+                failed += 1;
+                let result = failed_agent_import_result(&job_id, &error);
+                let finish_error = agent_bridge::fail_import(&job_id, &result).err();
+                let _ = app.emit("paper-manager:agent-import-result", result);
+                messages.push(match finish_error {
+                    Some(finish_error) => format!(
+                        "Could not read claimed agent import {} ({}): {error}; additionally could not record failure: {finish_error}",
+                        job_id,
+                        claimed.display()
+                    ),
+                    None => format!("Failed agent import {job_id}: {error}"),
+                });
+                continue;
+            }
+        };
+
+        match process_claimed_agent_import(&request) {
+            Ok((registered, warnings)) => {
+                let mut result = agent_bridge::AgentImportResult::completed(&job_id);
+                result.paper_id = Some(registered.paper_id.clone());
+                result.title = Some(registered.title.clone());
+                result.pdf_path = None;
+                result.message = format!("Imported \"{}\" into Legra.", registered.title);
+                result.warnings = warnings;
+                result.details = Some(serde_json::json!({
+                    "origin": request.origin,
+                    "identifier": request.identifier,
+                    "category": request.category,
+                    "has_pdf": registered.pdf_path.is_some(),
+                }));
+                match agent_bridge::complete_import(&job_id, &result) {
+                    Ok(_) => {
+                        imported += 1;
+                        messages.push(result.message.clone());
+                        let _ = app.emit("paper-manager:agent-import-result", result);
+                        let _ = app.emit("paper-manager:data-updated", ());
+                    }
+                    Err(error) => {
+                        failed += 1;
+                        messages.push(format!(
+                            "Paper was saved, but agent job {job_id} could not be finalized: {error}"
+                        ));
+                    }
+                }
+            }
+            Err(error) => {
+                failed += 1;
+                let result = failed_agent_import_result(&job_id, &error);
+                let finish_error = agent_bridge::fail_import(&job_id, &result).err();
+                let _ = app.emit("paper-manager:agent-import-result", result);
+                messages.push(match finish_error {
+                    Some(finish_error) => format!(
+                        "Failed agent import {job_id}: {error}; additionally could not record failure: {finish_error}"
+                    ),
+                    None => format!("Failed agent import {job_id}: {error}"),
+                });
+            }
+        }
+    }
+
+    let pending = agent_bridge::list_pending_import_ids()?.len();
+    Ok(AgentImportSummary {
+        imported,
+        failed,
+        pending,
+        messages,
+    })
+}
+
 #[tauri::command]
 fn open_register_paper_window(app: tauri::AppHandle) -> Result<(), String> {
     if let Some(window) = app.get_webview_window("register-paper") {
@@ -4308,7 +4930,14 @@ fn update_paper(app: tauri::AppHandle, input: UpdatePaperInput) -> Result<AppDat
 
     let mut data = load_or_default_app_data()?;
     let pdf_path = normalize_pdf_storage_path(&data, &input.pdf_path)?;
-    ensure_not_duplicate(&data, Some(&input.id), &input.title, &input.doi, &pdf_path)?;
+    ensure_not_duplicate(
+        &data,
+        Some(&input.id),
+        &input.title,
+        &input.doi,
+        &input.arxiv_id,
+        &pdf_path,
+    )?;
 
     let timestamp = current_timestamp()?;
     let paper = data
@@ -4602,6 +5231,151 @@ fn update_settings(app: tauri::AppHandle, input: UpdateSettingsInput) -> Result<
     save_data_file(&data)?;
     let _ = app.emit("paper-manager:data-updated", ());
     Ok(data)
+}
+
+fn mcp_connector_status_with_message(
+    message: Option<String>,
+) -> Result<McpConnectorStatus, String> {
+    let server_path = installed_mcp_server_binary_path()?;
+    let installed = server_path.exists() && server_path.is_file();
+    let installed_version = fs::read_to_string(installed_mcp_server_version_path()?)
+        .ok()
+        .map(|version| version.trim().to_string())
+        .filter(|version| !version.is_empty());
+    let server_path_string = server_path.to_string_lossy().into_owned();
+    let quoted_path =
+        serde_json::to_string(&server_path_string).map_err(|error| error.to_string())?;
+    let setting_dir_string = setting_dir()?.to_string_lossy().into_owned();
+    let quoted_setting_dir =
+        serde_json::to_string(&setting_dir_string).map_err(|error| error.to_string())?;
+    let codex_config = format!(
+        "[mcp_servers.legra]\ncommand = {quoted_path}\nenv = {{ LEGRA_SETTING_DIR = {quoted_setting_dir} }}\ndefault_tools_approval_mode = \"writes\"\n"
+    );
+    let claude_desktop_config = serde_json::to_string_pretty(&serde_json::json!({
+        "mcpServers": {
+            "legra": {
+                "command": server_path_string,
+                "args": [],
+                "env": {
+                    "LEGRA_SETTING_DIR": setting_dir_string
+                }
+            }
+        }
+    }))
+    .map_err(|error| error.to_string())?;
+    let default_message = if !installed {
+        "Legra MCP connector is not installed.".to_string()
+    } else if installed_version.as_deref() != Some(MCP_CONNECTOR_VERSION) {
+        "Legra MCP connector is installed but an update is available.".to_string()
+    } else {
+        "Legra MCP connector is installed. Add the shown configuration to Codex or Claude Desktop."
+            .to_string()
+    };
+
+    Ok(McpConnectorStatus {
+        installed,
+        server_path: server_path.to_string_lossy().into_owned(),
+        bundled_version: MCP_CONNECTOR_VERSION.to_string(),
+        installed_version,
+        codex_config,
+        claude_desktop_config,
+        message: message.unwrap_or(default_message),
+    })
+}
+
+#[tauri::command]
+fn check_mcp_connector() -> Result<McpConnectorStatus, String> {
+    mcp_connector_status_with_message(None)
+}
+
+fn install_mcp_connector_for(app: &tauri::AppHandle) -> Result<McpConnectorStatus, String> {
+    let source_path = bundled_mcp_server_binary_path(app)?;
+    let server_path = installed_mcp_server_binary_path()?;
+    let parent = server_path
+        .parent()
+        .ok_or_else(|| "Could not resolve MCP installation directory.".to_string())?;
+    fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let temporary = unique_path(
+        parent,
+        &format!(
+            ".{}.installing-{}",
+            platform::MCP_SERVER_BINARY_NAME,
+            std::process::id()
+        ),
+    );
+    let install_result = (|| -> Result<(), String> {
+        fs::copy(&source_path, &temporary).map_err(|error| {
+            format!(
+                "Could not stage Legra MCP server from {}: {error}",
+                source_path.to_string_lossy()
+            )
+        })?;
+        File::open(&temporary)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| format!("Could not sync Legra MCP server: {error}"))?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&temporary)
+                .map_err(|error| error.to_string())?
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&temporary, permissions).map_err(|error| error.to_string())?;
+        }
+
+        if server_path.exists() {
+            fs::remove_file(&server_path)
+                .map_err(|error| format!("Could not replace installed MCP server: {error}"))?;
+        }
+        fs::rename(&temporary, &server_path)
+            .map_err(|error| format!("Could not finalize MCP server installation: {error}"))?;
+        fs::write(installed_mcp_server_version_path()?, MCP_CONNECTOR_VERSION)
+            .map_err(|error| format!("Could not record MCP server version: {error}"))?;
+        Ok(())
+    })();
+    if let Err(error) = install_result {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+
+    mcp_connector_status_with_message(Some(
+        "Legra MCP connector installed. Add the shown configuration to Codex or Claude Desktop."
+            .to_string(),
+    ))
+}
+
+#[tauri::command]
+fn install_mcp_connector(app: tauri::AppHandle) -> Result<McpConnectorStatus, String> {
+    install_mcp_connector_for(&app)
+}
+
+#[tauri::command]
+fn uninstall_mcp_connector() -> Result<McpConnectorStatus, String> {
+    let server_path = installed_mcp_server_binary_path()?;
+    if server_path.exists() {
+        fs::remove_file(&server_path).map_err(|error| error.to_string())?;
+    }
+    let version_path = installed_mcp_server_version_path()?;
+    if version_path.exists() {
+        fs::remove_file(version_path).map_err(|error| error.to_string())?;
+    }
+    mcp_connector_status_with_message(Some("Legra MCP connector removed.".to_string()))
+}
+
+fn repair_existing_mcp_connector(app: &tauri::AppHandle) {
+    let is_installed = installed_mcp_server_binary_path()
+        .map(|path| path.exists())
+        .unwrap_or(false);
+    let installed_version = installed_mcp_server_version_path()
+        .ok()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .map(|version| version.trim().to_string());
+    if is_installed && installed_version.as_deref() != Some(MCP_CONNECTOR_VERSION) {
+        if let Err(error) = install_mcp_connector_for(app) {
+            eprintln!("Could not update existing Legra MCP connector: {error}");
+        }
+    }
 }
 
 fn chrome_native_host_status_for(extension_id: String) -> Result<ChromeNativeHostStatus, String> {
@@ -5430,6 +6204,128 @@ mod tests {
         }
     }
 
+    fn test_import_input(
+        title: &str,
+        doi: Option<&str>,
+        arxiv_id: Option<&str>,
+    ) -> RegisterPaperInput {
+        RegisterPaperInput {
+            title: title.to_string(),
+            authors: vec!["Grace Hopper".to_string()],
+            year: Some(2026),
+            publication: None,
+            volume: None,
+            issue: None,
+            pages: None,
+            numpages: None,
+            month: None,
+            publisher: None,
+            doi: doi.map(str::to_string),
+            arxiv_id: arxiv_id.map(str::to_string),
+            url: None,
+            abstract_text: None,
+            tags: vec!["agent-import".to_string()],
+            status: Some("unread".to_string()),
+            pdf_path: None,
+            folder_category: None,
+        }
+    }
+
+    #[test]
+    fn canonical_identifiers_strip_doi_urls_and_arxiv_versions() {
+        assert_eq!(
+            canonical_doi(Some("HTTPS://doi.org/10.1000/Example")),
+            Some("10.1000/example".to_string())
+        );
+        assert_eq!(
+            canonical_doi(Some("https://doi.org/10.1000/Example")),
+            Some("10.1000/example".to_string())
+        );
+        assert_eq!(
+            canonical_arxiv_id(Some("arXiv:2601.00001v3")),
+            Some("2601.00001".to_string())
+        );
+        assert_eq!(
+            resolve_import_identifiers("https://doi.org/10.48550/arXiv.2601.00001v3").unwrap(),
+            (None, Some("2601.00001".to_string()))
+        );
+    }
+
+    #[test]
+    fn restricted_download_addresses_are_rejected() {
+        for address in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "169.254.1.1",
+            "192.168.1.1",
+            "::1",
+            "fe80::1",
+            "fec0::1",
+            "fd00::1",
+        ] {
+            assert!(ip_is_restricted_for_download(address.parse().unwrap()));
+        }
+        assert!(!ip_is_restricted_for_download("1.1.1.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn import_with_identifier_does_not_merge_on_title_alone() {
+        let mut data = AppData {
+            papers: vec![test_paper(Some("10.1000/first"), None)],
+            notes: Vec::new(),
+            settings: test_settings(),
+        };
+
+        let outcome = register_or_update_import_input_into_data(
+            &mut data,
+            test_import_input("A test paper", Some("10.1000/second"), None),
+        )
+        .unwrap();
+
+        assert_eq!(data.papers.len(), 2);
+        assert_eq!(outcome.paper_id, data.papers[1].id);
+    }
+
+    #[test]
+    fn import_merges_on_canonical_arxiv_id_before_title() {
+        let mut existing = test_paper(None, Some("2601.00001v1"));
+        existing.title = "Original title".to_string();
+        let mut data = AppData {
+            papers: vec![existing],
+            notes: Vec::new(),
+            settings: test_settings(),
+        };
+
+        let outcome = register_or_update_import_input_into_data(
+            &mut data,
+            test_import_input("Changed title", None, Some("arXiv:2601.00001v4")),
+        )
+        .unwrap();
+
+        assert_eq!(data.papers.len(), 1);
+        assert_eq!(outcome.paper_id, "paper-test");
+    }
+
+    #[test]
+    fn import_merges_arxiv_id_with_existing_arxiv_doi() {
+        let mut existing = test_paper(Some("10.48550/arXiv.2601.00001v2"), None);
+        existing.title = "Original title".to_string();
+        let mut data = AppData {
+            papers: vec![existing],
+            notes: Vec::new(),
+            settings: test_settings(),
+        };
+
+        let outcome = register_or_update_import_input_into_data(
+            &mut data,
+            test_import_input("Changed title", None, Some("2601.00001")),
+        )
+        .unwrap();
+
+        assert_eq!(data.papers.len(), 1);
+        assert_eq!(outcome.paper_id, "paper-test");
+    }
+
     #[test]
     fn managed_pdf_scan_is_recursive_and_skips_internal_directory() {
         let root = temp_test_dir("managed-scan");
@@ -5867,6 +6763,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             repair_existing_chrome_native_host(app.handle());
+            repair_existing_mcp_connector(app.handle());
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();
                 let _ = window.set_focus();
@@ -5935,6 +6832,7 @@ pub fn run() {
             fetch_paper_metadata,
             resolve_paper_import,
             process_extension_imports,
+            process_agent_imports,
             open_register_paper_window,
             open_settings_window,
             open_edit_paper_window,
@@ -5945,6 +6843,9 @@ pub fn run() {
             sync_managed_library,
             resolve_folder_category,
             update_settings,
+            check_mcp_connector,
+            install_mcp_connector,
+            uninstall_mcp_connector,
             check_chrome_native_host,
             install_chrome_native_host,
             uninstall_chrome_native_host,
