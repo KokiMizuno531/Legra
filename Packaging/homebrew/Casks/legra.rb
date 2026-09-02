@@ -1,6 +1,6 @@
 cask "legra" do
-  version "0.2.5"
-  sha256 "c1b1dc171f29d8e5b55f21b5472bfa35ab299dd68c1c78a1a392353f74cb48b5"
+  version "0.3.0"
+  sha256 "2f40507525a48a2cbadfb47a6840c1186c468c28dd9bdc2c1d3435db5231c5a9"
 
   url "https://github.com/KokiMizuno531/Legra/releases/download/v#{version}/Legra_#{version}_aarch64.app.zip"
   name "Legra"
