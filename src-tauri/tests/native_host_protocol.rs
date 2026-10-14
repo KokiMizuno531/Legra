@@ -168,3 +168,39 @@ fn native_host_lists_managed_library_directory_categories() {
     let _ = fs::remove_dir_all(setting_dir);
     let _ = fs::remove_dir_all(managed_dir);
 }
+
+#[test]
+fn native_host_preserves_arxiv_identifier_provenance() {
+    let setting_dir = unique_temp_dir("native-host-import");
+    fs::create_dir_all(&setting_dir).unwrap();
+
+    let request = serde_json::json!({
+        "action": "import_paper",
+        "request": {
+            "id": "chrome-import-provenance-test",
+            "source_url": "https://publisher.example/paper",
+            "doi": "10.1000/journal-paper",
+            "arxiv_id": "2501.01234",
+            "arxiv_source": "metadata",
+            "title": "Test paper"
+        }
+    });
+    let response = send_native_request(&setting_dir, request.to_string().as_bytes());
+    assert_eq!(
+        response.get("ok").and_then(|value| value.as_bool()),
+        Some(true)
+    );
+
+    let request_path = response
+        .get("request_path")
+        .and_then(|value| value.as_str())
+        .unwrap();
+    let queued: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(request_path).unwrap()).unwrap();
+    assert_eq!(
+        queued.get("arxiv_source").and_then(|value| value.as_str()),
+        Some("metadata")
+    );
+
+    let _ = fs::remove_dir_all(setting_dir);
+}

@@ -56,3 +56,4 @@ jobs:
         run: |
           node --check chrome-extension/service_worker.js
           node --check chrome-extension/popup.js
+          node --test chrome-extension/popup.test.cjs chrome-extension/service_worker.test.cjs

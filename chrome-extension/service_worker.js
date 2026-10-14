@@ -102,10 +102,15 @@ function pageDetector() {
     extractDoiInPage(document.body?.innerText || "") ||
     hrefs.map(extractDoiInPage).find(Boolean) ||
     "";
-  const arxiv_id =
-    extractArxivInPage(location.href) ||
-    hrefs.map(extractArxivInPage).find(Boolean) ||
-    "";
+  const arxivFromUrl = extractArxivInPage(location.href);
+  const arxivFromMetadata = normalizeArxivInPage(
+    meta("citation_arxiv_id") ||
+      meta("arxiv_id") ||
+      meta("eprints.eprintid") ||
+      meta("citation_eprint"),
+  );
+  const arxiv_id = arxivFromUrl || arxivFromMetadata || "";
+  const arxiv_source = arxivFromUrl ? "page_url" : arxivFromMetadata ? "metadata" : "";
   const pdf_url =
     meta("citation_pdf_url") ||
     hrefs.find((href) => /\.pdf($|[?#])/i.test(href)) ||
@@ -119,6 +124,7 @@ function pageDetector() {
     abstract_text: meta("citation_abstract") || meta("description") || "",
     doi: normalizeDoiInPage(doi),
     arxiv_id: normalizeArxivInPage(arxiv_id),
+    arxiv_source,
     pdf_url,
     source_url: location.href,
   };
@@ -126,11 +132,13 @@ function pageDetector() {
 
 async function detectCurrentTab() {
   const tab = await activeTab();
+  const tabArxivId = extractArxivFromUrl(tab.url);
   let paper = {
     title: tab.title || "",
     authors: [],
     doi: extractDoiFromText(tab.url),
-    arxiv_id: extractArxivFromUrl(tab.url),
+    arxiv_id: tabArxivId,
+    arxiv_source: tabArxivId ? "page_url" : "",
     pdf_url: /\.pdf($|[?#])/i.test(tab.url) ? tab.url : "",
     source_url: tab.url,
   };
@@ -255,6 +263,7 @@ async function importCurrentTab(message) {
     source_url: paper.source_url,
     doi: paper.doi || undefined,
     arxiv_id: paper.arxiv_id || undefined,
+    arxiv_source: paper.arxiv_source || undefined,
     title: paper.title || undefined,
     authors: paper.authors?.length ? paper.authors : undefined,
     year: paper.year,
@@ -283,18 +292,24 @@ async function importCurrentTab(message) {
   };
 }
 
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  const run =
-    message.action === "detect_current_tab"
-      ? detectCurrentTab().then((paper) => ({ ok: true, paper }))
-      : message.action === "list_categories"
-        ? sendNativeListCategories()
-      : message.action === "import_current_tab"
-        ? importCurrentTab(message)
-        : Promise.resolve({ ok: false, message: "Unknown action." });
+if (typeof module !== "undefined") {
+  module.exports = { pageDetector };
+}
 
-  run.then(sendResponse).catch((error) =>
-    sendResponse({ ok: false, message: String(error.message || error) }),
-  );
-  return true;
-});
+if (typeof chrome !== "undefined") {
+  chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    const run =
+      message.action === "detect_current_tab"
+        ? detectCurrentTab().then((paper) => ({ ok: true, paper }))
+        : message.action === "list_categories"
+          ? sendNativeListCategories()
+        : message.action === "import_current_tab"
+          ? importCurrentTab(message)
+          : Promise.resolve({ ok: false, message: "Unknown action." });
+
+    run.then(sendResponse).catch((error) =>
+      sendResponse({ ok: false, message: String(error.message || error) }),
+    );
+    return true;
+  });
+}

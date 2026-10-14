@@ -44,6 +44,7 @@ struct ExtensionImportRequest {
     source_url: Option<String>,
     doi: Option<String>,
     arxiv_id: Option<String>,
+    arxiv_source: Option<String>,
     title: Option<String>,
     authors: Option<Vec<String>>,
     year: Option<u16>,

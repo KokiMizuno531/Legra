@@ -201,6 +201,7 @@ struct ExtensionImportRequest {
     source_url: Option<String>,
     doi: Option<String>,
     arxiv_id: Option<String>,
+    arxiv_source: Option<String>,
     title: Option<String>,
     authors: Option<Vec<String>>,
     year: Option<u16>,
@@ -3892,57 +3893,87 @@ fn register_or_update_import_input_into_data(
     })
 }
 
+fn source_url_is_arxiv(url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(url.trim()) else {
+        return false;
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if !matches!(
+        host.trim_end_matches('.').to_ascii_lowercase().as_str(),
+        "arxiv.org" | "www.arxiv.org"
+    ) {
+        return false;
+    }
+    let mut segments = url
+        .path_segments()
+        .into_iter()
+        .flatten()
+        .filter(|segment| !segment.is_empty());
+    matches!(segments.next(), Some("abs" | "pdf")) && segments.next().is_some()
+}
+
+fn trusted_request_arxiv_id(request: &ExtensionImportRequest) -> Option<String> {
+    let arxiv_id = request
+        .arxiv_id
+        .as_deref()
+        .map(normalize_arxiv_id)
+        .filter(|arxiv_id| !arxiv_id.is_empty())?;
+    let source_is_arxiv = request
+        .source_url
+        .as_deref()
+        .is_some_and(source_url_is_arxiv);
+    let doi = request
+        .doi
+        .as_deref()
+        .map(normalize_doi)
+        .filter(|doi| !doi.is_empty());
+    let doi_is_arxiv = doi
+        .as_deref()
+        .is_some_and(|doi| doi.to_ascii_lowercase().starts_with("10.48550/arxiv."));
+    let declared_metadata = request.arxiv_source.as_deref() == Some("metadata");
+
+    (source_is_arxiv || doi.is_none() || doi_is_arxiv || declared_metadata).then_some(arxiv_id)
+}
+
 fn metadata_for_import_request(
     request: &ExtensionImportRequest,
 ) -> Result<Option<PaperMetadata>, String> {
-    let has_identifier = request
+    let doi = request
         .doi
-        .as_ref()
-        .map(|doi| !doi.trim().is_empty())
-        .unwrap_or(false)
-        || request
-            .arxiv_id
-            .as_ref()
-            .map(|arxiv_id| !arxiv_id.trim().is_empty())
-            .unwrap_or(false);
+        .as_deref()
+        .map(normalize_doi)
+        .filter(|doi| !doi.is_empty());
+    let arxiv_id = trusted_request_arxiv_id(request);
+    let has_identifier = doi.is_some() || arxiv_id.is_some();
 
     if !has_identifier {
         return Ok(None);
     }
 
-    let arxiv_id = request
-        .arxiv_id
+    let source_is_arxiv = request
+        .source_url
         .as_deref()
-        .map(normalize_arxiv_id)
-        .filter(|arxiv_id| !arxiv_id.is_empty());
-    let source_is_arxiv = request.source_url.as_deref().is_some_and(|url| {
-        let lowercase = url.to_ascii_lowercase();
-        lowercase.contains("arxiv.org/abs/") || lowercase.contains("arxiv.org/pdf/")
-    });
-    let doi_is_arxiv = request.doi.as_deref().is_some_and(|doi| {
-        normalize_doi(doi)
-            .to_ascii_lowercase()
-            .starts_with("10.48550/arxiv.")
-    });
+        .is_some_and(source_url_is_arxiv);
+    let doi_is_arxiv = doi
+        .as_deref()
+        .is_some_and(|doi| doi.to_ascii_lowercase().starts_with("10.48550/arxiv."));
 
     if let Some(arxiv_id) = arxiv_id.as_deref() {
-        if source_is_arxiv || doi_is_arxiv || request.doi.as_deref().is_none_or(str::is_empty) {
+        if source_is_arxiv || doi_is_arxiv || doi.is_none() {
             return metadata_for_arxiv_import_request(request, arxiv_id).map(Some);
         }
     }
 
-    if let Some(doi) = request.doi.as_deref().map(normalize_doi) {
-        if !doi.is_empty() {
-            match fetch_doi_metadata(&doi) {
-                Ok(metadata) => return Ok(Some(metadata)),
-                Err(error) => {
-                    if arxiv_id.is_some() {
-                        // arXiv pages often expose a 10.48550/arXiv.* DOI that may not be in Crossref yet.
-                    } else {
-                        return Err(error);
-                    }
-                }
-            }
+    if let Some(doi) = doi.as_deref() {
+        match fetch_doi_metadata(doi) {
+            Ok(metadata) => return Ok(Some(metadata)),
+            Err(error) if arxiv_id.is_none() => return Err(error),
+            Err(_) => {}
         }
     }
 
@@ -4108,8 +4139,7 @@ fn import_pdf_path(request: &ExtensionImportRequest) -> Option<String> {
         return Some(pdf_path);
     }
 
-    request
-        .arxiv_id
+    trusted_request_arxiv_id(request)
         .as_deref()
         .and_then(|arxiv_id| download_arxiv_pdf(arxiv_id).ok())
         .map(|path| path.to_string_lossy().into_owned())
@@ -4134,6 +4164,7 @@ fn import_doi(metadata: Option<&PaperMetadata>, request_doi: Option<&str>) -> Op
 fn import_request_to_register_input(
     request: ExtensionImportRequest,
 ) -> Result<RegisterPaperInput, String> {
+    let trusted_arxiv_id = trusted_request_arxiv_id(&request);
     let metadata = metadata_for_import_request(&request)?;
     let valid_pdf_path = import_pdf_path(&request);
     let doi = import_doi(metadata.as_ref(), request.doi.as_deref());
@@ -4209,11 +4240,7 @@ fn import_request_to_register_input(
         arxiv_id: metadata
             .as_ref()
             .and_then(|metadata| metadata.arxiv_id.clone())
-            .or_else(|| {
-                request
-                    .arxiv_id
-                    .map(|arxiv_id| normalize_arxiv_id(&arxiv_id))
-            }),
+            .or(trusted_arxiv_id),
         url: metadata
             .as_ref()
             .and_then(|metadata| metadata.url.clone())
@@ -6621,12 +6648,62 @@ mod tests {
     }
 
     #[test]
+    fn publisher_reference_arxiv_id_is_not_trusted_without_provenance() {
+        let request: ExtensionImportRequest = serde_json::from_value(serde_json::json!({
+            "source_url": "https://www.nature.com/articles/s41567-026-03337-w",
+            "doi": "10.1038/s41567-026-03337-w",
+            "arxiv_id": "2309.02355"
+        }))
+        .unwrap();
+
+        assert_eq!(trusted_request_arxiv_id(&request), None);
+
+        let lookalike: ExtensionImportRequest = serde_json::from_value(serde_json::json!({
+            "source_url": "https://arxiv.org.evil.example/abs/2309.02355",
+            "doi": "10.1038/s41567-026-03337-w",
+            "arxiv_id": "2309.02355"
+        }))
+        .unwrap();
+
+        assert_eq!(trusted_request_arxiv_id(&lookalike), None);
+    }
+
+    #[test]
+    fn authoritative_arxiv_sources_remain_supported() {
+        let arxiv_page: ExtensionImportRequest = serde_json::from_value(serde_json::json!({
+            "source_url": "https://arxiv.org/abs/2507.02793v3",
+            "doi": "10.1000/journal-paper",
+            "arxiv_id": "2507.02793v3",
+            "arxiv_source": "page_url"
+        }))
+        .unwrap();
+        assert_eq!(
+            trusted_request_arxiv_id(&arxiv_page).as_deref(),
+            Some("2507.02793")
+        );
+
+        let publisher_metadata: ExtensionImportRequest =
+            serde_json::from_value(serde_json::json!({
+                "source_url": "https://publisher.example/paper",
+                "doi": "10.1000/journal-paper",
+                "arxiv_id": "2501.01234v2",
+                "arxiv_source": "metadata"
+            }))
+            .unwrap();
+        assert_eq!(
+            trusted_request_arxiv_id(&publisher_metadata).as_deref(),
+            Some("2501.01234")
+        );
+    }
+
+    #[test]
     fn complete_browser_arxiv_metadata_does_not_require_remote_fetch() {
         let request = ExtensionImportRequest {
             id: Some("chrome-import-test".to_string()),
             source_url: Some("https://arxiv.org/abs/2507.02793".to_string()),
             doi: Some("10.48550/arXiv.2507.02793".to_string()),
             arxiv_id: Some("2507.02793".to_string()),
+            arxiv_source: Some("page_url".to_string()),
             title: Some("A browser title".to_string()),
             authors: Some(vec!["Ada Lovelace".to_string()]),
             year: Some(2025),
