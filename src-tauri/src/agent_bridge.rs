@@ -481,10 +481,54 @@ fn strip_arxiv_version(value: &str) -> &str {
     value
 }
 
+pub fn nature_article_doi(input: &str) -> Option<String> {
+    let url = reqwest::Url::parse(input.trim()).ok()?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return None;
+    }
+    let host = url.host_str()?.trim_end_matches('.').to_ascii_lowercase();
+    if !matches!(host.as_str(), "nature.com" | "www.nature.com") {
+        return None;
+    }
+    let segments = url
+        .path_segments()?
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    if segments.len() != 2 || !segments[0].eq_ignore_ascii_case("articles") {
+        return None;
+    }
+    let slug = urlencoding::decode(segments[1]).ok()?;
+    let slug = slug.trim().to_ascii_lowercase();
+    let slug = slug.strip_suffix(".pdf").unwrap_or(&slug);
+    if slug.is_empty()
+        || slug.len() > 200
+        || !slug.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
+        })
+    {
+        return None;
+    }
+    let doi = format!("10.1038/{slug}");
+    doi_regex().is_match(&doi).then_some(doi)
+}
+
 pub fn normalize_identifier(input: &str) -> Result<AgentPaperIdentifier, String> {
     let input = input.trim();
     if input.is_empty() || input.len() > 512 || input.chars().any(char::is_control) {
-        return Err("Identifier must be a non-empty DOI or arXiv identifier.".to_string());
+        return Err(
+            "Identifier must be a non-empty DOI, Nature article URL, or arXiv identifier."
+                .to_string(),
+        );
+    }
+
+    if let Some(value) = nature_article_doi(input) {
+        return Ok(AgentPaperIdentifier {
+            kind: IdentifierKind::Doi,
+            value,
+        });
     }
 
     let lower = input.to_ascii_lowercase();
@@ -566,7 +610,10 @@ pub fn normalize_identifier(input: &str) -> Result<AgentPaperIdentifier, String>
         });
     }
 
-    Err("Only DOI/doi.org and arXiv identifiers or URLs are accepted.".to_string())
+    Err(
+        "Only DOI/doi.org, Nature article URLs, and arXiv identifiers or URLs are accepted."
+            .to_string(),
+    )
 }
 
 fn normalize_origin(origin: &str) -> String {
@@ -1304,6 +1351,35 @@ mod tests {
                 value: "2401.12345".to_string(),
             }
         );
+        assert_eq!(
+            normalize_identifier(
+                "https://www.nature.com/articles/s41567-026-03337-w?utm_source=test#abstract"
+            )
+            .unwrap(),
+            AgentPaperIdentifier {
+                kind: IdentifierKind::Doi,
+                value: "10.1038/s41567-026-03337-w".to_string(),
+            }
+        );
+        assert_eq!(
+            normalize_identifier("https://nature.com/articles/nphys1234").unwrap(),
+            AgentPaperIdentifier {
+                kind: IdentifierKind::Doi,
+                value: "10.1038/nphys1234".to_string(),
+            }
+        );
+        assert_eq!(
+            normalize_identifier("https://www.nature.com/articles/s41567-026-03337-w.pdf").unwrap(),
+            AgentPaperIdentifier {
+                kind: IdentifierKind::Doi,
+                value: "10.1038/s41567-026-03337-w".to_string(),
+            }
+        );
+        assert!(normalize_identifier(
+            "https://www.nature.com.evil.example/articles/s41567-026-03337-w"
+        )
+        .is_err());
+        assert!(normalize_identifier("https://www.nature.com/subjects/spintronics").is_err());
         assert!(normalize_identifier("https://example.com/paper.pdf").is_err());
         assert!(normalize_identifier("/tmp/paper.pdf").is_err());
     }

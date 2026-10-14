@@ -13,7 +13,7 @@ It is built with Tauri, React, and Rust. The app is designed for researchers who
 - Configure BibTeX citation key rules.
 - Normalize journal names at export time using editable journal aliases.
 - Import metadata and accessible PDFs from Chrome via a companion extension.
-- Queue DOI and arXiv papers found by Codex App or Claude Desktop through a local MCP connector.
+- Queue DOI, Nature article URL, and arXiv papers found by Codex App or Claude Desktop through a local MCP connector.
 - Create shared workspaces in Google Drive, Dropbox, iCloud Drive, or any synced folder.
 - Keep PDFs and notes as regular files that can be backed up or inspected without Legra.
 
@@ -29,7 +29,7 @@ Legra is not a Zotero or Mendeley replacement. It focuses on a smaller workflow:
 - no publisher authentication bypass
 
 The Chrome extension only works with pages and PDFs that the user can legitimately access in their
-browser. The MCP connector accepts DOI and arXiv identifiers only. It makes a best-effort attempt to
+browser. The MCP connector accepts DOI, `nature.com/articles` URLs, and arXiv identifiers. It makes a best-effort attempt to
 retrieve open-access PDFs and otherwise keeps a metadata-only record; it does not accept arbitrary
 download URLs, reuse browser sessions, bypass paywalls, or circumvent publisher authentication.
 
@@ -148,7 +148,7 @@ cargo check --bin legra_mcp
 ## Codex App and Claude Desktop
 
 Legra ships a local MCP server named `legra_mcp`. It lets Codex App and Claude Desktop check the
-library, list categories, normalize a DOI or arXiv identifier and check for an existing record,
+library, list categories, normalize a DOI, Nature article URL, or arXiv identifier and check for an existing record,
 queue an import, and check the queued job's result. The MCP process never writes Legra's catalog or
 managed PDF directory directly. It places a versioned job in Legra's import queue; the Legra app
 validates and performs the import.
@@ -219,7 +219,7 @@ processed the next time Legra starts. Consequently, an MCP `import_paper` result
 job was queued, not necessarily that a PDF has already been downloaded. Use `get_import_status` to
 distinguish `pending`, `processing`, `done`, and `failed` jobs.
 
-Agent imports accept normalized DOI or arXiv identifiers only. PDF retrieval is unauthenticated and
+Agent imports accept normalized DOI, Nature article URL, or arXiv identifiers. PDF retrieval is unauthenticated and
 best-effort: arXiv or a direct PDF link advertised by Crossref may yield a PDF, while inaccessible
 DOI records are registered as metadata-only. `open_access_only` means Legra will not use a logged-in
 session or bypass a paywall; it is not a legal determination of the document's reuse license.

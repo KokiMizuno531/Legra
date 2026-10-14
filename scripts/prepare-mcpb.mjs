@@ -31,10 +31,10 @@ if (platform !== "win32") {
 await copyFile(join(projectRoot, "src-tauri", "icons", "icon.png"), join(outputDirectory, "icon.png"));
 
 const tools = [
-  ["resolve_paper", "Normalize a DOI or arXiv identifier and check whether it is already in Legra."],
+  ["resolve_paper", "Normalize a DOI, Nature article URL, or arXiv identifier and check whether it is already in Legra."],
   ["search_library", "Search papers already registered in the local Legra library."],
   ["list_categories", "List the folder categories currently available in Legra."],
-  ["import_paper", "Queue a DOI or arXiv paper for validated import by the Legra desktop app."],
+  ["import_paper", "Queue a DOI, Nature article URL, or arXiv paper for validated import by the Legra desktop app."],
   ["get_import_status", "Check the status and result of a queued Legra import job."],
 ].map(([name, description]) => ({ name, description }));
 
@@ -45,7 +45,7 @@ const manifest = {
   version: packageJson.version,
   description: "Import papers found by Claude into the local-first Legra paper library.",
   long_description:
-    "Queues DOI and arXiv identifiers for Legra to validate, download when permitted, organize, and register. Legra remains the only process that writes the paper catalog.",
+    "Queues DOI, Nature article URLs, and arXiv identifiers for Legra to validate, download when permitted, organize, and register. Legra remains the only process that writes the paper catalog.",
   author: {
     name: "Koki Mizuno",
   },

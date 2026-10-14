@@ -115,7 +115,7 @@ fn tools() -> Value {
         {
             "name": "resolve_paper",
             "title": "Resolve paper identifier",
-            "description": "Normalize a DOI or arXiv identifier and check whether it is already present in the local Legra library. This does not access the network.",
+            "description": "Normalize a DOI, Nature article URL, or arXiv identifier and check whether it is already present in the local Legra library. This does not access the network.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -123,7 +123,7 @@ fn tools() -> Value {
                         "type": "string",
                         "minLength": 1,
                         "maxLength": 512,
-                        "description": "A DOI, doi.org URL, arXiv ID, or arxiv.org abs/pdf URL."
+                        "description": "A DOI, doi.org URL, nature.com/articles URL, arXiv ID, or arxiv.org abs/pdf URL."
                     }
                 },
                 "required": ["identifier"],
@@ -169,7 +169,7 @@ fn tools() -> Value {
         {
             "name": "import_paper",
             "title": "Import paper into Legra",
-            "description": "Queue a DOI or arXiv paper for Legra to import. Arbitrary URLs and local PDF paths are deliberately rejected. open_access_only is the default; metadata_only never requests a PDF download.",
+            "description": "Queue a DOI, Nature article URL, or arXiv paper for Legra to import. Other publisher URLs and local PDF paths are deliberately rejected. open_access_only is the default; metadata_only never requests a PDF download.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -177,7 +177,7 @@ fn tools() -> Value {
                         "type": "string",
                         "minLength": 1,
                         "maxLength": 512,
-                        "description": "A DOI, doi.org URL, arXiv ID, or arxiv.org abs/pdf URL."
+                        "description": "A DOI, doi.org URL, nature.com/articles URL, arXiv ID, or arxiv.org abs/pdf URL."
                     },
                     "category": {
                         "type": "string",
@@ -365,7 +365,7 @@ fn initialize_result(params: &Value, state: &mut ServerState) -> Value {
             "name": SERVER_NAME,
             "version": env!("CARGO_PKG_VERSION")
         },
-        "instructions": "Legra imports papers by canonical DOI or arXiv identifier. Use resolve_paper or search_library to check for duplicates, list_categories when a destination is needed, import_paper to enqueue, and get_import_status to observe completion. Never pass arbitrary download URLs or local file paths. open_access_only is the default download policy."
+        "instructions": "Legra imports papers by canonical DOI, Nature article URL, or arXiv identifier. Use resolve_paper or search_library to check for duplicates, list_categories when a destination is needed, import_paper to enqueue, and get_import_status to observe completion. Never pass arbitrary download URLs or local file paths. open_access_only is the default download policy."
     })
 }
 

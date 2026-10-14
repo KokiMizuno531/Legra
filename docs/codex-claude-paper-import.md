@@ -1,7 +1,7 @@
 # Import papers from Codex App or Claude Desktop
 
 Legra 0.3.0 and later include a local MCP server that lets Codex App or Claude Desktop search your
-Legra library and queue DOI or arXiv papers for import. Legra remains the only process that changes
+Legra library and queue DOI, Nature article URL, or arXiv papers for import. Legra remains the only process that changes
 the catalog or managed PDF directory.
 
 ## Install or upgrade Legra on macOS
@@ -75,7 +75,7 @@ Import arXiv:1706.03762 into Legra with the tag "codex-import". Check the import
 
 Approve the `import_paper` call when Codex asks. A typical successful sequence is:
 
-1. `resolve_paper` normalizes the DOI or arXiv ID and checks for an existing record.
+1. `resolve_paper` normalizes the DOI, Nature article URL, or arXiv ID and checks for an existing record.
 2. `import_paper` returns a stable `job_id` and an initial `pending` state.
 3. Legra claims the job from its main window at startup or during its 15-second poll.
 4. `get_import_status` returns `done` or `failed`.
@@ -89,7 +89,7 @@ available.
 
 - Keep the main Legra window open for imports to run immediately. When Legra is closed, jobs remain
   pending until the next launch.
-- Imports accept DOI, `doi.org`, arXiv ID, and `arxiv.org` identifiers only. Arbitrary URLs and local
+- Imports accept DOI, `doi.org`, `nature.com/articles`, arXiv ID, and `arxiv.org` identifiers. Other publisher URLs and local
   paths are rejected intentionally.
 - PDF retrieval is unauthenticated and best effort. Legra does not reuse browser cookies, bypass a
   paywall, or determine the legal reuse license of a paper.

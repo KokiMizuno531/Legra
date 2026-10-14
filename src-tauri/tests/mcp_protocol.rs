@@ -149,7 +149,7 @@ fn stdio_mcp_initializes_lists_tools_and_enqueues_idempotently() {
     assert!(initialized
         .pointer("/result/instructions")
         .and_then(Value::as_str)
-        .is_some_and(|value| value.contains("DOI or arXiv")));
+        .is_some_and(|value| value.contains("Nature article URL")));
 
     // A notification must produce no stdout. The next line read below must belong
     // to request id 2, which also verifies stdout remains JSON-RPC-only.
@@ -212,6 +212,26 @@ fn stdio_mcp_initializes_lists_tools_and_enqueues_idempotently() {
         .pointer("/result/content/0/text")
         .and_then(Value::as_str)
         .is_some());
+
+    let nature_resolved = mcp.request(tool_call(
+        31,
+        "resolve_paper",
+        json!({
+            "identifier": "https://www.nature.com/articles/s41567-026-03337-w"
+        }),
+    ));
+    assert_eq!(
+        nature_resolved
+            .pointer("/result/structuredContent/identifier/kind")
+            .and_then(Value::as_str),
+        Some("doi")
+    );
+    assert_eq!(
+        nature_resolved
+            .pointer("/result/structuredContent/identifier/value")
+            .and_then(Value::as_str),
+        Some("10.1038/s41567-026-03337-w")
+    );
 
     let imported = mcp.request(tool_call(
         4,

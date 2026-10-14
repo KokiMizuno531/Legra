@@ -1617,7 +1617,11 @@ fn looks_like_doi(value: &str) -> bool {
 fn resolve_import_identifiers(source: &str) -> Result<(Option<String>, Option<String>), String> {
     let source = source.trim();
     if source.is_empty() {
-        return Err("Enter a DOI, arXiv ID, or paper URL.".to_string());
+        return Err("Enter a DOI, Nature article URL, or arXiv ID/URL.".to_string());
+    }
+
+    if let Some(doi) = agent_bridge::nature_article_doi(source) {
+        return Ok((Some(doi), None));
     }
 
     if looks_like_doi(source) {
@@ -1632,7 +1636,7 @@ fn resolve_import_identifiers(source: &str) -> Result<(Option<String>, Option<St
         return Ok((None, Some(normalize_arxiv_id(source))));
     }
 
-    Err("Could not recognize the input as a DOI or arXiv ID/URL.".to_string())
+    Err("Could not recognize the input as a DOI, Nature article URL, or arXiv ID/URL.".to_string())
 }
 
 fn first_json_string(value: &serde_json::Value, key: &str) -> Option<String> {
@@ -6248,6 +6252,13 @@ mod tests {
         assert_eq!(
             resolve_import_identifiers("https://doi.org/10.48550/arXiv.2601.00001v3").unwrap(),
             (None, Some("2601.00001".to_string()))
+        );
+        assert_eq!(
+            resolve_import_identifiers(
+                "https://www.nature.com/articles/s41567-026-03337-w?utm_source=test"
+            )
+            .unwrap(),
+            (Some("10.1038/s41567-026-03337-w".to_string()), None)
         );
     }
 

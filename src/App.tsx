@@ -1010,7 +1010,7 @@ function App() {
 
   async function resolvePaperImport() {
     if (!importSource.trim()) {
-      setError("Enter a DOI, arXiv ID, or paper URL before fetching.");
+      setError("Enter a DOI, Nature article URL, or arXiv ID/URL before fetching.");
       return null;
     }
 
@@ -2397,7 +2397,7 @@ function App() {
         <form className="panel registration-form" onSubmit={registerPaper}>
           <div className="section-heading">
             <h2>Register paper</h2>
-            <p>Paste a DOI, arXiv ID, or paper URL to fetch metadata and import available PDFs.</p>
+            <p>Paste a DOI, Nature article URL, or arXiv ID/URL to fetch metadata and import available PDFs.</p>
           </div>
 
           <label>
@@ -2405,7 +2405,7 @@ function App() {
             <input
               value={importSource}
               onChange={(event) => setImportSource(event.currentTarget.value)}
-              placeholder="10.1103/... or 2401.00000 or https://arxiv.org/abs/..."
+              placeholder="10.1103/... or https://nature.com/articles/... or https://arxiv.org/abs/..."
             />
           </label>
 
