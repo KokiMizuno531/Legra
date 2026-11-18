@@ -1736,6 +1736,8 @@ fn parse_crossref_metadata(
         .get("message")
         .ok_or_else(|| "Crossref response did not contain metadata.".to_string())?;
     let (year, month) = crossref_year_and_month(message);
+    let doi = first_json_string(message, "DOI").unwrap_or_else(|| requested_doi.to_string());
+    let doi = aps_doi_from_crossref(message, &doi).unwrap_or(doi);
 
     Ok(PaperMetadata {
         title: first_json_string(message, "title"),
@@ -1749,7 +1751,7 @@ fn parse_crossref_metadata(
         numpages: None,
         month,
         publisher: first_json_string(message, "publisher"),
-        doi: first_json_string(message, "DOI").or_else(|| Some(requested_doi.to_string())),
+        doi: Some(doi),
         arxiv_id: None,
         url: first_json_string(message, "URL"),
         abstract_text: first_json_string(message, "abstract"),
@@ -1862,16 +1864,35 @@ fn is_aps_doi(doi: &str) -> bool {
         .starts_with("10.1103/")
 }
 
+fn aps_doi_from_crossref(message: &serde_json::Value, doi: &str) -> Option<String> {
+    if !is_aps_doi(doi) {
+        return None;
+    }
+    // APS Harvest looks up the published DOI with case-sensitive matching.
+    let url = reqwest::Url::parse(message.pointer("/resource/primary/URL")?.as_str()?).ok()?;
+    if !matches!(url.host_str(), Some("link.aps.org" | "journals.aps.org")) {
+        return None;
+    }
+    let (_, suffix) = url.path().split_once("/10.1103/")?;
+    let published_doi = format!("10.1103/{suffix}");
+    published_doi
+        .eq_ignore_ascii_case(doi)
+        .then_some(published_doi)
+}
+
+fn aps_article_url(doi: &str) -> String {
+    let path_doi = urlencoding::encode(doi).replace("%2F", "/");
+    format!("https://harvest.aps.org/v2/journals/articles/{path_doi}")
+}
+
 fn fetch_aps_metadata(doi: &str) -> Result<PaperMetadata, String> {
     let doi = normalize_doi(doi);
     if doi.is_empty() {
         return Err("DOI is required.".to_string());
     }
 
-    let path_doi = urlencoding::encode(&doi).replace("%2F", "/");
-    let url = format!("https://harvest.aps.org/v2/journals/articles/{path_doi}");
     let response = metadata_http_client()?
-        .get(url)
+        .get(aps_article_url(&doi))
         .header(reqwest::header::ACCEPT, "application/json")
         .send()
         .map_err(|error| format!("Could not fetch APS metadata: {error}"))?;
@@ -1903,10 +1924,10 @@ fn fetch_doi_metadata(doi: &str) -> Result<PaperMetadata, String> {
     }
 }
 
-fn crossref_pdf_url_for_doi(doi: &str) -> Result<Option<String>, String> {
+fn crossref_pdf_urls_for_doi(doi: &str) -> Result<Vec<reqwest::Url>, String> {
     let doi = doi.trim();
     if doi.is_empty() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
 
     let client = metadata_http_client()?;
@@ -1920,30 +1941,52 @@ fn crossref_pdf_url_for_doi(doi: &str) -> Result<Option<String>, String> {
         .map_err(|error| format!("Could not check DOI PDF links: {error}"))?;
 
     if !response.status().is_success() {
-        return Ok(None);
+        return Err(format!(
+            "Could not check DOI PDF links. HTTP status: {}.",
+            response.status()
+        ));
     }
 
     let json = response
         .json::<serde_json::Value>()
         .map_err(|error| format!("Could not parse DOI PDF links: {error}"))?;
-    let Some(links) = json
-        .get("message")
-        .and_then(|message| message.get("link"))
-        .and_then(|links| links.as_array())
-    else {
-        return Ok(None);
-    };
+    Ok(crossref_pdf_urls(&json))
+}
 
-    Ok(links.iter().find_map(|link| {
-        let url = link.get("URL").and_then(|value| value.as_str())?;
-        let content_type = link
-            .get("content-type")
-            .and_then(|value| value.as_str())
-            .unwrap_or("")
-            .to_lowercase();
-        let lower_url = url.to_lowercase();
-        (content_type.contains("pdf") || lower_url.ends_with(".pdf")).then(|| url.to_string())
-    }))
+fn crossref_pdf_urls(json: &serde_json::Value) -> Vec<reqwest::Url> {
+    let mut seen = HashSet::new();
+    json.pointer("/message/link")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|link| {
+            let mut url = reqwest::Url::parse(link.get("URL")?.as_str()?).ok()?;
+            if url.scheme() == "http" {
+                url.set_scheme("https").ok()?;
+            }
+            let content_type = link
+                .get("content-type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .split(';')
+                .next()
+                .unwrap_or_default()
+                .trim();
+            let path = url.path().to_ascii_lowercase();
+            let pdf_path = path.ends_with(".pdf")
+                || path
+                    .split('/')
+                    .any(|segment| matches!(segment, "pdf" | "article-pdf"));
+            (url.scheme() == "https"
+                && (content_type.eq_ignore_ascii_case("application/pdf") || pdf_path))
+                .then_some(url)
+        })
+        .map(|mut url| {
+            url.set_fragment(None);
+            url
+        })
+        .filter(|url| seen.insert(url.clone()))
+        .collect()
 }
 
 fn child_text<'a>(node: roxmltree::Node<'a, 'a>, child_name: &str) -> Option<String> {
@@ -2599,13 +2642,14 @@ fn pdf_download_http_client() -> Result<reqwest::blocking::Client, String> {
         .map_err(|error| error.to_string())
 }
 
-fn download_pdf(url: &str, file_stem: &str) -> Result<PathBuf, String> {
+fn download_pdf(url: &str, file_stem: &str, accept: &str) -> Result<PathBuf, String> {
     let parsed_url = reqwest::Url::parse(url)
         .map_err(|error| format!("Could not parse PDF download URL: {error}"))?;
     validate_pdf_download_url(&parsed_url)?;
     let client = pdf_download_http_client()?;
     let mut response = client
         .get(parsed_url)
+        .header(reqwest::header::ACCEPT, accept)
         .send()
         .map_err(|error| format!("Could not download PDF: {error}"))?;
 
@@ -2624,6 +2668,13 @@ fn download_pdf(url: &str, file_stem: &str) -> Result<PathBuf, String> {
             "PDF download exceeds the {} MiB limit.",
             MAX_PDF_DOWNLOAD_BYTES / 1024 / 1024
         ));
+    }
+    let mut signature = [0; 5];
+    response
+        .read_exact(&mut signature)
+        .map_err(|error| format!("Could not read PDF header: {error}"))?;
+    if signature != *b"%PDF-" {
+        return Err("Downloaded file was not a PDF.".to_string());
     }
 
     let dir = imports_dir()?;
@@ -2645,8 +2696,10 @@ fn download_pdf(url: &str, file_stem: &str) -> Result<PathBuf, String> {
             .create_new(true)
             .open(&temporary)
             .map_err(|error| format!("Could not create temporary PDF file: {error}"))?;
-        let mut prefix = Vec::with_capacity(5);
-        let mut total = 0_u64;
+        output
+            .write_all(&signature)
+            .map_err(|error| format!("Could not write PDF download: {error}"))?;
+        let mut total = signature.len() as u64;
         let mut buffer = [0_u8; 64 * 1024];
 
         loop {
@@ -2665,18 +2718,11 @@ fn download_pdf(url: &str, file_stem: &str) -> Result<PathBuf, String> {
                     MAX_PDF_DOWNLOAD_BYTES / 1024 / 1024
                 ));
             }
-            if prefix.len() < 5 {
-                let remaining = 5 - prefix.len();
-                prefix.extend_from_slice(&buffer[..read.min(remaining)]);
-            }
             output
                 .write_all(&buffer[..read])
                 .map_err(|error| format!("Could not write PDF download: {error}"))?;
         }
 
-        if !prefix.starts_with(b"%PDF-") {
-            return Err("Downloaded file was not a PDF.".to_string());
-        }
         output
             .sync_all()
             .map_err(|error| format!("Could not sync PDF download: {error}"))?;
@@ -2696,15 +2742,42 @@ fn download_pdf(url: &str, file_stem: &str) -> Result<PathBuf, String> {
 fn download_arxiv_pdf(arxiv_id: &str) -> Result<PathBuf, String> {
     let arxiv_id = normalize_arxiv_id(arxiv_id);
     let url = format!("https://arxiv.org/pdf/{arxiv_id}.pdf");
-    download_pdf(&url, &format!("arxiv_{arxiv_id}"))
+    download_pdf(&url, &format!("arxiv_{arxiv_id}"), "*/*")
 }
 
 fn download_crossref_pdf(doi: &str) -> Result<Option<PathBuf>, String> {
-    let Some(url) = crossref_pdf_url_for_doi(doi)? else {
-        return Ok(None);
-    };
+    let urls = crossref_pdf_urls_for_doi(doi)?;
     let file_stem = format!("doi_{}", normalize_doi(doi));
-    download_pdf(&url, &file_stem).map(Some)
+    let mut last_error = None;
+    for url in urls {
+        match download_pdf(url.as_str(), &file_stem, "*/*") {
+            Ok(path) => return Ok(Some(path)),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    last_error.map_or(Ok(None), Err)
+}
+
+fn download_doi_pdf(doi: &str, metadata_doi: Option<&str>) -> Result<Option<PathBuf>, String> {
+    if !is_aps_doi(doi) {
+        return download_crossref_pdf(doi);
+    }
+
+    let doi = normalize_doi(doi);
+    let aps_doi = metadata_doi
+        .filter(|metadata_doi| metadata_doi.eq_ignore_ascii_case(&doi))
+        .unwrap_or(&doi);
+    let file_stem = format!("doi_{doi}");
+    match download_pdf(&aps_article_url(aps_doi), &file_stem, "application/pdf") {
+        Ok(path) => Ok(Some(path)),
+        Err(aps_error) => match download_crossref_pdf(&doi) {
+            Ok(Some(path)) => Ok(Some(path)),
+            Ok(None) => Err(format!("APS PDF download failed: {aps_error}")),
+            Err(crossref_error) => Err(format!(
+                "APS PDF download failed: {aps_error} Crossref fallback also failed: {crossref_error}"
+            )),
+        },
+    }
 }
 
 fn move_file_with_fallback(source: &Path, target: &Path) -> Result<(), String> {
@@ -3876,6 +3949,9 @@ fn register_or_update_import_input_into_data(
             paper.original_pdf_path = valid_pdf_path.clone();
         }
         merge_tags(&mut paper.tags, input.tags.clone());
+        if added_pdf {
+            paper.tags.retain(|tag| tag != "pdf-missing");
+        }
         paper.updated_at = timestamp;
     }
 
@@ -4123,26 +4199,29 @@ fn metadata_for_arxiv_import_request(
 }
 
 fn valid_import_pdf_path(request: &ExtensionImportRequest) -> Option<String> {
-    request.pdf_path.clone().and_then(|pdf_path| {
-        let path = Path::new(&pdf_path);
-        let is_pdf = path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .map(|extension| extension.eq_ignore_ascii_case("pdf"))
-            .unwrap_or(false);
-        (path.exists() && path.is_file() && is_pdf).then_some(pdf_path)
-    })
+    let pdf_path = request.pdf_path.as_deref()?;
+    let path = Path::new(pdf_path);
+    if !is_pdf_path(path) || !path.is_file() {
+        return None;
+    }
+    let mut signature = [0; 5];
+    fs::File::open(path).ok()?.read_exact(&mut signature).ok()?;
+    (signature == *b"%PDF-").then(|| pdf_path.to_string())
 }
 
-fn import_pdf_path(request: &ExtensionImportRequest) -> Option<String> {
+fn import_pdf_path(request: &ExtensionImportRequest, doi: Option<&str>) -> Option<String> {
     if let Some(pdf_path) = valid_import_pdf_path(request) {
         return Some(pdf_path);
     }
 
-    trusted_request_arxiv_id(request)
-        .as_deref()
-        .and_then(|arxiv_id| download_arxiv_pdf(arxiv_id).ok())
-        .map(|path| path.to_string_lossy().into_owned())
+    let downloaded = doi
+        .and_then(|doi| download_doi_pdf(doi, None).ok().flatten())
+        .or_else(|| {
+            trusted_request_arxiv_id(request)
+                .as_deref()
+                .and_then(|arxiv_id| download_arxiv_pdf(arxiv_id).ok())
+        });
+    downloaded.map(|path| path.to_string_lossy().into_owned())
 }
 
 fn import_doi(metadata: Option<&PaperMetadata>, request_doi: Option<&str>) -> Option<String> {
@@ -4166,8 +4245,8 @@ fn import_request_to_register_input(
 ) -> Result<RegisterPaperInput, String> {
     let trusted_arxiv_id = trusted_request_arxiv_id(&request);
     let metadata = metadata_for_import_request(&request)?;
-    let valid_pdf_path = import_pdf_path(&request);
     let doi = import_doi(metadata.as_ref(), request.doi.as_deref());
+    let valid_pdf_path = import_pdf_path(&request, doi.as_deref());
     let title = metadata
         .as_ref()
         .and_then(|metadata| metadata.title.clone())
@@ -4202,12 +4281,13 @@ fn import_request_to_register_input(
     if !tags.iter().any(|tag| tag == "chrome-import") {
         tags.push("chrome-import".to_string());
     }
-    let has_pdf_warning = request
-        .import_warnings
-        .as_ref()
-        .map(|warnings| !warnings.is_empty())
-        .unwrap_or(false)
-        || (request.pdf_path.is_some() && valid_pdf_path.is_none());
+    let has_pdf_warning = valid_pdf_path.is_none()
+        && (request.pdf_path.is_some()
+            || doi.is_some()
+            || request
+                .import_warnings
+                .as_ref()
+                .is_some_and(|warnings| !warnings.is_empty()));
     if has_pdf_warning && !tags.iter().any(|tag| tag == "pdf-missing") {
         tags.push("pdf-missing".to_string());
     }
@@ -4306,8 +4386,13 @@ fn process_extension_import_file_into_data(
     let input = import_request_to_register_input(request)?;
     let imported = register_or_update_import_input_into_data(data, input)?;
     move_import_file(path, &extension_import_processed_dir()?)?;
+    let pdf_status = if imported.pdf_path.is_some() {
+        ""
+    } else {
+        " PDF unavailable."
+    };
     Ok(format!(
-        "Imported \"{}\".",
+        "Imported \"{}\".{pdf_status}",
         if imported.title.is_empty() {
             title_hint
         } else {
@@ -4471,7 +4556,7 @@ fn resolve_paper_import(input: ResolvePaperImportInput) -> Result<PaperImportRes
 
     let metadata = if let Some(doi) = doi.as_deref() {
         let metadata = fetch_doi_metadata(doi)?;
-        match download_crossref_pdf(doi) {
+        match download_doi_pdf(doi, metadata.doi.as_deref()) {
             Ok(Some(path)) => {
                 downloaded_pdf_path = Some(path.to_string_lossy().into_owned());
             }
@@ -4698,22 +4783,23 @@ fn process_claimed_agent_import(
                     None
                 }
             },
-            agent_bridge::IdentifierKind::Doi => match download_crossref_pdf(&identifier) {
-                Ok(Some(path)) => Some(path),
-                Ok(None) => {
-                    warnings.push(
-                        "Crossref did not provide a direct open PDF link; metadata was imported instead."
-                            .to_string(),
-                    );
-                    None
+            agent_bridge::IdentifierKind::Doi => {
+                let download = download_doi_pdf(&identifier, metadata.doi.as_deref());
+                match download {
+                    Ok(Some(path)) => Some(path),
+                    Ok(None) => {
+                        warnings
+                            .push("No direct PDF link found. Imported metadata only.".to_string());
+                        None
+                    }
+                    Err(error) => {
+                        warnings.push(format!(
+                            "PDF download failed ({error}). Imported metadata only."
+                        ));
+                        None
+                    }
                 }
-                Err(error) => {
-                    warnings.push(format!(
-                        "Could not download the Crossref PDF; metadata was imported instead: {error}"
-                    ));
-                    None
-                }
-            },
+            }
         }
     };
 
@@ -6365,6 +6451,44 @@ mod tests {
     }
 
     #[test]
+    fn aps_reimport_places_downloaded_pdf_in_selected_category() {
+        let root = temp_test_dir("aps-import");
+        let managed = root.join("library");
+        let downloaded = root.join("browser-download.pdf");
+        let doi = "10.1103/PhysRevX.14.040501";
+        let mut existing = test_paper(Some(doi), None);
+        existing.tags.push("pdf-missing".to_string());
+        let mut data = AppData {
+            papers: vec![existing],
+            notes: Vec::new(),
+            settings: test_settings(),
+        };
+        data.settings.managed_directory = Some(managed.to_string_lossy().into_owned());
+        data.settings.filename_rule = "aps-article".to_string();
+        let request: ExtensionImportRequest = serde_json::from_value(serde_json::json!({
+            "pdf_path": downloaded.to_string_lossy()
+        }))
+        .unwrap();
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&downloaded, b"<!doctype html><title>Sign in</title>").unwrap();
+        assert!(valid_import_pdf_path(&request).is_none());
+        write_test_pdf(&downloaded);
+
+        let mut input = test_import_input("An APS paper", Some(doi), None);
+        input.pdf_path = valid_import_pdf_path(&request);
+        input.folder_category = Some("Physics/Scattering".to_string());
+        let outcome = register_or_update_import_input_into_data(&mut data, input).unwrap();
+
+        let expected_path = managed.join("Physics/Scattering/aps-article.pdf");
+        assert_eq!(outcome.pdf_path.as_deref(), expected_path.to_str());
+        assert_eq!(fs::read(expected_path).unwrap(), b"%PDF-1.4\n% test pdf\n");
+        assert!(!downloaded.exists());
+        assert_eq!(data.papers.len(), 1);
+        assert!(!data.papers[0].tags.iter().any(|tag| tag == "pdf-missing"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn managed_pdf_scan_is_recursive_and_skips_internal_directory() {
         let root = temp_test_dir("managed-scan");
         let visible = root.join("physics").join("paper.PDF");
@@ -6406,7 +6530,31 @@ mod tests {
     }
 
     #[test]
-    fn crossref_article_number_fills_missing_pages() {
+    fn crossref_pdf_candidates_include_jpsj_and_extensionless_publisher_paths() {
+        let jpsj = "https://journals.jps.jp/doi/pdf/10.7566/JPSJ.94.064705";
+        let iop = "https://iopscience.iop.org/article/10.1088/1367-2630/add7fd/pdf";
+        let nature = "https://www.nature.com/articles/s41467-024-45951-3.pdf?download=1";
+        let aip = "https://pubs.aip.org/article-pdf/10.1063/5.0281124/1";
+        let json = serde_json::json!({
+            "message": {"link": [
+                {"URL": jpsj, "content-type": "unspecified"},
+                {"URL": iop},
+                {"URL": nature, "content-type": "unspecified"},
+                {"URL": aip, "content-type": "application/pdf"},
+                {"URL": jpsj.replace("https:", "http:")},
+                {"URL": format!("{iop}#page=1")},
+                {"URL": "https://journals.jps.jp/doi/epdf/10.7566/JPSJ.94.064705"},
+                {"URL": "https://api.elsevier.com/content/article?httpAccept=text/xml"}
+            ]}
+        });
+
+        let links = crossref_pdf_urls(&json);
+        let links = links.iter().map(reqwest::Url::as_str).collect::<Vec<_>>();
+        assert_eq!(links, [jpsj, iop, nature, aip]);
+    }
+
+    #[test]
+    fn crossref_aps_metadata_preserves_article_number_and_published_doi_case() {
         let json = serde_json::json!({
             "message": {
                 "title": ["Article-number paper"],
@@ -6418,14 +6566,16 @@ mod tests {
                 "published": {"date-parts": [[2022, 12, 8]]},
                 "publisher": "American Physical Society (APS)",
                 "DOI": "10.1103/physrevx.12.040501",
+                "resource": {"primary": {"URL": "https://link.aps.org/doi/10.1103/PhysRevX.12.040501"}},
                 "URL": "https://doi.org/10.1103/physrevx.12.040501"
             }
         });
 
-        let metadata = parse_crossref_metadata(&json, "10.1103/PhysRevX.12.040501").unwrap();
+        let metadata = parse_crossref_metadata(&json, "10.1103/physrevx.12.040501").unwrap();
 
         assert_eq!(metadata.pages.as_deref(), Some("040501"));
         assert_eq!(metadata.month.as_deref(), Some("Dec"));
+        assert_eq!(metadata.doi.as_deref(), Some("10.1103/PhysRevX.12.040501"));
     }
 
     #[test]

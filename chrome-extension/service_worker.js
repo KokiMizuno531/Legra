@@ -31,6 +31,46 @@ function extractArxivFromUrl(url) {
   return normalizeArxiv(url);
 }
 
+function publisherArticleFromUrl(url) {
+  const parsed = new URL(url);
+  if (parsed.protocol !== "https:") return null;
+
+  if (parsed.hostname === "journals.jps.jp") {
+    const doi = parsed.pathname.match(
+      /^\/doi\/(?:abs\/|full\/|pdf\/|epdf\/)?(10\.7566\/[a-z0-9._-]+)\/?$/i,
+    )?.[1];
+    if (!doi) return null;
+    return { doi, pdf_url: `${parsed.origin}/doi/pdf/${doi}?download=true` };
+  }
+
+  if (parsed.hostname === "iopscience.iop.org") {
+    const doi = parsed.pathname.match(
+      /^\/article\/(10\.1088\/[a-z0-9-]+(?:\/[a-z0-9-]+)*)\/pdf\/?$/i,
+    )?.[1];
+    if (doi) return { doi, pdf_url: parsed.href };
+  }
+
+  if (parsed.hostname === "pubs.aip.org") {
+    const doi = parsed.pathname.match(/\/article-pdf\/doi\/(10\.1063\/[a-z0-9._-]+)\//i)?.[1];
+    if (doi) return { doi, pdf_url: parsed.href };
+  }
+
+  let article;
+  if (parsed.hostname === "journals.aps.org") {
+    article = parsed.pathname.match(
+      /^(?<journal>\/[a-z0-9-]+)\/(?:abstract|fulltext|pdf)\/(?<doi>10\.1103\/[-._;():a-z0-9]+)\/?$/i,
+    );
+  } else if (parsed.hostname === "link.aps.org") {
+    article = parsed.pathname.match(
+      /^\/(?:article|doi|pdf)\/(?<doi>10\.1103\/[-._;():a-z0-9]+)\/?$/i,
+    );
+  }
+  if (!article) return null;
+
+  const { journal = "", doi } = article.groups;
+  return { doi, pdf_url: `${parsed.origin}${journal}/pdf/${doi}` };
+}
+
 function safeFilenamePart(value) {
   return String(value || "paper")
     .replace(/[^a-z0-9_-]+/gi, "_")
@@ -95,13 +135,15 @@ function pageDetector() {
     meta("DC.Date") ||
     "";
   const year = Number.parseInt(yearValue.slice(0, 4), 10);
-  const doi =
+  const doi = normalizeDoiInPage(
     meta("citation_doi") ||
     meta("dc.identifier") ||
     meta("DC.Identifier") ||
+    extractDoiInPage(location.href) ||
     extractDoiInPage(document.body?.innerText || "") ||
     hrefs.map(extractDoiInPage).find(Boolean) ||
-    "";
+    "",
+  );
   const arxivFromUrl = extractArxivInPage(location.href);
   const arxivFromMetadata = normalizeArxivInPage(
     meta("citation_arxiv_id") ||
@@ -111,10 +153,24 @@ function pageDetector() {
   );
   const arxiv_id = arxivFromUrl || arxivFromMetadata || "";
   const arxiv_source = arxivFromUrl ? "page_url" : arxivFromMetadata ? "metadata" : "";
-  const pdf_url =
-    meta("citation_pdf_url") ||
-    hrefs.find((href) => /\.pdf($|[?#])/i.test(href)) ||
-    (location.href.toLowerCase().includes(".pdf") ? location.href : "");
+  const pdfMeta = meta("citation_pdf_url") ||
+    document.querySelector('link[rel="alternate"][type="application/pdf"]')?.href;
+  const pdfLinks = anchors.filter((anchor) =>
+    /\.pdf($|[?#])|\/(?:pdf|article-pdf|pdfft)(?=\/|[?#]|$)/i.test(anchor.href || ""),
+  );
+  const doiPath = `/${doi.toLowerCase()}`;
+  const articlePdfLink = (doi && pdfLinks.find((anchor) => {
+    const path = anchor.href.split(/[?#]/, 1)[0].toLowerCase();
+    return path.endsWith(doiPath) || path.includes(`${doiPath}/`) || path.endsWith(`${doiPath}.pdf`);
+  })) || pdfLinks.find((anchor) => {
+    const label = anchor.getAttribute?.("aria-label") || anchor.textContent || "";
+    return /^(?:view pdf|download pdf|pdf(?: \(download\))?)$/i.test(label.trim());
+  });
+  const pdf_url = pdfMeta ||
+    (/\.pdf($|[?#])/i.test(location.href) ? location.href : "") ||
+    articlePdfLink?.href ||
+    (!doi ? hrefs.find((href) => /\.pdf($|[?#])/i.test(href)) : "") ||
+    "";
 
   return {
     title,
@@ -122,7 +178,7 @@ function pageDetector() {
     year: Number.isFinite(year) ? year : undefined,
     publication: meta("citation_journal_title") || meta("dc.source") || "",
     abstract_text: meta("citation_abstract") || meta("description") || "",
-    doi: normalizeDoiInPage(doi),
+    doi,
     arxiv_id: normalizeArxivInPage(arxiv_id),
     arxiv_source,
     pdf_url,
@@ -153,6 +209,20 @@ async function detectCurrentTab() {
     // Chrome's PDF viewer and restricted pages may reject script injection.
   }
 
+  const publisherArticle = publisherArticleFromUrl(tab.url);
+  if (publisherArticle) {
+    Object.assign(paper, publisherArticle);
+  }
+
+  if (paper.pdf_url) {
+    try {
+      const pdfUrl = new URL(paper.pdf_url, tab.url);
+      paper.pdf_url = ["https:", "http:"].includes(pdfUrl.protocol) ? pdfUrl.href : "";
+    } catch (_) {
+      paper.pdf_url = "";
+    }
+  }
+
   if (paper.arxiv_id && !paper.pdf_url) {
     paper.pdf_url = `https://arxiv.org/pdf/${paper.arxiv_id}.pdf`;
   }
@@ -162,26 +232,23 @@ async function detectCurrentTab() {
 
 function waitForDownload(downloadId) {
   return new Promise((resolve, reject) => {
-    const listener = async (delta) => {
-      if (delta.id !== downloadId || !delta.state?.current) return;
-      if (delta.state.current === "complete") {
+    const settle = (state) => {
+      if (state === "complete" || state === "interrupted") {
         chrome.downloads.onChanged.removeListener(listener);
-        const [item] = await chrome.downloads.search({ id: downloadId });
-        const filename = item?.filename || "";
-        if (!filename.toLowerCase().endsWith(".pdf")) {
-          await cleanupDownload(downloadId);
-          reject(new Error(`Downloaded file was not a PDF: ${filename || "unknown file"}`));
-          return;
-        }
-        resolve({ downloadId, filename });
-      }
-      if (delta.state.current === "interrupted") {
-        chrome.downloads.onChanged.removeListener(listener);
-        await cleanupDownload(downloadId);
-        reject(new Error("PDF download was interrupted."));
+        resolve(state);
       }
     };
+    const listener = (delta) => {
+      if (delta.id === downloadId) settle(delta.state?.current);
+    };
     chrome.downloads.onChanged.addListener(listener);
+    chrome.downloads.search({ id: downloadId }).then(
+      ([item]) => settle(item?.state),
+      (error) => {
+        chrome.downloads.onChanged.removeListener(listener);
+        reject(error);
+      },
+    );
   });
 }
 
@@ -207,7 +274,20 @@ async function downloadPdf(paper) {
     conflictAction: "uniquify",
     saveAs: false,
   });
-  return waitForDownload(downloadId);
+  try {
+    if ((await waitForDownload(downloadId)) === "interrupted") {
+      throw new Error("PDF download was interrupted.");
+    }
+    const [item] = await chrome.downloads.search({ id: downloadId });
+    const filename = item?.filename || "";
+    if (!filename.toLowerCase().endsWith(".pdf") || /^text\/html\b/i.test(item?.mime || "")) {
+      throw new Error(`Downloaded file was not a PDF: ${filename || "unknown file"}`);
+    }
+    return { downloadId, filename };
+  } catch (error) {
+    await cleanupDownload(downloadId);
+    throw error;
+  }
 }
 
 function sendNativeImport(request) {

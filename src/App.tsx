@@ -1038,7 +1038,7 @@ function App() {
     }
   }
 
-  async function registerForm(registrationForm: PaperForm) {
+  async function registerForm(registrationForm: PaperForm, importWarnings: string[] = []) {
     setError(null);
 
     if (!isReadyToRegister(registrationForm)) {
@@ -1059,7 +1059,7 @@ function App() {
       setMessage(
         registeredPaper?.pdf_path
           ? `Registered and organized "${registeredPaper.title}".`
-          : `Registered "${registeredPaper?.title}".`,
+          : [`Registered "${registeredPaper?.title}".`, ...importWarnings].join(" "),
       );
     } catch (reason) {
       setError(String(reason));
@@ -1079,7 +1079,7 @@ function App() {
     }
 
     const resolvedForm = mergeResolvedImport(form, resolution);
-    await registerForm(resolvedForm);
+    await registerForm(resolvedForm, resolution.warnings);
   }
 
   async function saveEditedPaper(event: React.FormEvent<HTMLFormElement>) {
