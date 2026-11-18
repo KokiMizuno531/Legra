@@ -6479,8 +6479,14 @@ mod tests {
         input.folder_category = Some("Physics/Scattering".to_string());
         let outcome = register_or_update_import_input_into_data(&mut data, input).unwrap();
 
-        let expected_path = managed.join("Physics/Scattering/aps-article.pdf");
-        assert_eq!(outcome.pdf_path.as_deref(), expected_path.to_str());
+        let expected_path = managed
+            .join("Physics")
+            .join("Scattering")
+            .join("aps-article.pdf");
+        assert_eq!(
+            outcome.pdf_path.as_deref().map(Path::new),
+            Some(expected_path.as_path())
+        );
         assert_eq!(fs::read(expected_path).unwrap(), b"%PDF-1.4\n% test pdf\n");
         assert!(!downloaded.exists());
         assert_eq!(data.papers.len(), 1);
